@@ -724,30 +724,54 @@ async fn ollama_runs_a_permitted_tool_it_was_not_offered() {
 async fn ollama_is_shown_the_tools_its_approved_plan_names() {
     let message = "make it sound spacious";
 
-    // A step names its tool as the model wrote it, which is not always a
-    // registered name: "add_reverb" is about the `reverb` tool.
-    for step_tool in ["reverb", "add_reverb"] {
-        let plan = format!(
-            r#"I will add a reverb. <plan>[{{"step":1,"tool":"{step_tool}","description":"Add reverb"}}]</plan>"#
-        );
-        let planned = run_with(
-            "ollama",
-            message,
-            vec![
-                ok(chat_reply_json("general")),
-                ok(chat_reply_json(&plan)),
-                ok(chat_sse_text("Done.")),
-            ],
-            true,
-        )
-        .await;
-        planned.result.as_ref().expect("the turn succeeds");
-        let with_plan = tool_names_in(&planned.streaming[0].body["tools"]);
-        assert!(
-            with_plan.contains("reverb"),
-            "a plan step for {step_tool:?} did not bring in reverb: {with_plan:?}"
-        );
-    }
+    // The plan request names the real tools and a step is checked against
+    // them (#482), so a step names its tool exactly.
+    let plan = r#"I will add a reverb. <plan>[{"step":1,"tool":"reverb","description":"Add reverb"}]</plan>"#;
+    let planned = run_with(
+        "ollama",
+        message,
+        vec![
+            ok(chat_reply_json("general")),
+            ok(chat_reply_json(plan)),
+            ok(chat_sse_text("Done.")),
+        ],
+        true,
+    )
+    .await;
+    planned.result.as_ref().expect("the turn succeeds");
+    let with_plan = tool_names_in(&planned.streaming[0].body["tools"]);
+    assert!(
+        with_plan.contains("reverb"),
+        "a plan step for reverb did not bring in reverb: {with_plan:?}"
+    );
+
+    // "add_reverb" is about the `reverb` tool, but it is not a tool. Before
+    // the plan was checked the slim set read it that way. Now the step is
+    // dropped as unknown before any tool is chosen, so an invented name
+    // brings nothing in. `reverb` is still named in the system prompt, so
+    // the model can call it by name, as it can any tool it was not sent.
+    let invented = r#"I will add a reverb. <plan>[{"step":1,"tool":"add_reverb","description":"Add reverb"}]</plan>"#;
+    let dropped = run_with(
+        "ollama",
+        message,
+        vec![
+            ok(chat_reply_json("general")),
+            ok(chat_reply_json(invented)),
+            ok(chat_sse_text("Done.")),
+        ],
+        true,
+    )
+    .await;
+    dropped.result.as_ref().expect("the turn succeeds");
+    let sent = tool_names_in(&dropped.streaming[0].body["tools"]);
+    assert!(
+        !sent.contains("reverb"),
+        "an invented tool name brought in a tool: {sent:?}"
+    );
+    assert!(
+        names_line_words(&system_text(&dropped.streaming[0].body)).contains("reverb"),
+        "reverb was neither sent nor named"
+    );
 
     let unplanned = run("ollama", message, chat_script()).await;
     unplanned.result.as_ref().expect("the turn succeeds");

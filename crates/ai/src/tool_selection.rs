@@ -160,7 +160,11 @@ pub const SLIM_NAMES_BUDGET_BYTES: usize = 1_600;
 /// (`separate_stems`, `transcribe`: their inference is not shipped). The
 /// full list still carries them, with the description saying so; a small
 /// model is better served by not being offered them at all.
-const NOT_IMPLEMENTED_MARKER: &str = "NOT IMPLEMENTED";
+///
+/// The one place this is written down on the `ai` side: the plan check
+/// (`agent_loop::vet_plan`, #482) reads it through [`is_not_implemented`]
+/// too, to mark a plan step that names such a tool.
+pub(crate) const NOT_IMPLEMENTED_MARKER: &str = "NOT IMPLEMENTED";
 
 /// Tools that only work on a transcript of the session, and have nothing
 /// else to work from: without one they answer "this session has no
@@ -515,7 +519,11 @@ fn json_len(tool: &Value) -> usize {
 }
 
 /// Whether a tool's description says it does nothing in this build.
-fn is_not_implemented(tool: &Value) -> bool {
+///
+/// Takes the tool's schema (`{ name, description, input_schema }`). Shared
+/// with the plan check, so what the slim tool set leaves out and what a
+/// plan step is marked "unavailable" for cannot drift apart.
+pub(crate) fn is_not_implemented(tool: &Value) -> bool {
     tool.get("description")
         .and_then(Value::as_str)
         .is_some_and(|d| d.trim_start().starts_with(NOT_IMPLEMENTED_MARKER))
@@ -1241,6 +1249,32 @@ mod tests {
         );
         let selection = slim_tool_schemas(available, "remove the ums", &[], &[]);
         assert_eq!(names(&selection.tools), vec!["gain"]);
+    }
+
+    /// The marker is read off the tools' own descriptions, so it is only as
+    /// good as those descriptions. Two readers depend on it: the slim set
+    /// above, and the plan check, which marks a plan step naming such a tool
+    /// "unavailable" (#482). This is the check that both stubs still carry
+    /// it, and that a working tool does not: either way the other half of
+    /// the pair is wrong.
+    #[test]
+    fn the_registered_stubs_carry_the_marker_and_working_tools_do_not() {
+        let registry = all_tools();
+        let flagged = |name: &str| -> bool {
+            let schema = registry
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap_or_else(|| panic!("{name} is not registered"));
+            is_not_implemented(schema)
+        };
+        for stub in ["separate_stems", "transcribe"] {
+            assert!(flagged(stub), "{stub} no longer reads as not implemented");
+        }
+        for working in ["analyze_track", "reverse", "set_track_gain", "label"] {
+            assert!(!flagged(working), "{working} reads as not implemented");
+        }
     }
 
     /// `duck_under_speech` reads the transcript when there is one, but with
