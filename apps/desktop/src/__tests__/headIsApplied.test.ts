@@ -44,6 +44,10 @@ if (app.trim().length === 0) {
  * absent: they are passed as thunks to `commitTrackChange`, which
  * applies the head for them. `cutTranscriptWords` is absent because it
  * already calls `setHeadLocal` directly.
+ *
+ * A call passed as a thunk to `applyEdit` has its head adopted too:
+ * `applyEdit` sends the command in the session's line and applies what it
+ * returns inside the same turn (#498), which the last test below holds it to.
  */
 const HEAD_RETURNING = [
   "addMarker",
@@ -70,7 +74,7 @@ function callSites(name: string): string[] {
  * adopts still fails.
  */
 function adopted(name: string, line: string): boolean {
-  if (line.includes("applyNewHead")) return true;
+  if (line.includes("applyNewHead") || line.includes("applyEdit(")) return true;
   const bound = line.match(new RegExp(`\\b(?:const|let)\\s+(\\w+)\\s*=\\s*await\\s+${name}\\(`));
   return bound !== null && new RegExp(`applyNewHead\\(\\s*${bound[1]}\\.`).test(app);
 }
@@ -123,5 +127,77 @@ describe("applyNewHead does the two things a new head requires", () => {
     // `batch_load` returns `last_node_id: string | null` — a load that
     // appended nothing must leave the head where it is.
     expect(body).toMatch(/if\s*\(!newHead\)\s*return/);
+  });
+});
+
+describe("applyEdit adopts a head in the session's line", () => {
+  /**
+   * `applyEdit` is what stands in for `applyNewHead(await command())` at
+   * the call sites that pass a thunk. It has to adopt the head *inside*
+   * the session's line: adopted after the turn, the next edit could be sent
+   * and answered before the head from this one was applied, and the head
+   * would go back (#498).
+   */
+  it("applies what the command returns inside the turn", () => {
+    const body = app.match(/const applyEdit = useCallback\(([\s\S]*?)\n {2}\);/)?.[1];
+    expect(body, "applyEdit is not defined as a useCallback").toBeTruthy();
+    expect(body).toMatch(
+      /inOrder\(\s*async \(\) => \{\s*applyNewHead\(await command\(\)\);\s*\}\)/,
+    );
+  });
+});
+
+describe("a head is adopted inside a turn, and nowhere else", () => {
+  /**
+   * A head adopted after its turn has ended is adopted out of line: the
+   * next edit may already be on its way, and the adoption can put the head
+   * back to a node that edit has left. It holds today only because an IPC
+   * answer is a macrotask, which is not something to build on. So each
+   * place that moves the frontend's head either sits in a handler that is
+   * a turn (`inOrder(`, `applyEdit(`), or is one of the two that are not an
+   * edit:
+   *
+   * - `applyNewHead`, which is what the turns call.
+   * - `handleSelectGraphNode`, a click on a node in the graph, which
+   *   previews it. The head it names was not moved on the backend.
+   *
+   * What it replaced: Record and Timer record adopted the head their take
+   * returned a second time, after `loadInOrder` had adopted it in its
+   * turn, and Accept B adopted its head in a callback that ran after the
+   * command's turn.
+   */
+  const NOT_AN_EDIT = ["applyNewHead", "handleSelectGraphNode"];
+  const IN_A_TURN = /\b(inOrder|applyEdit)\(/;
+  const lines = app.split("\n");
+
+  /** The `const x = useCallback(` a line is in, down to the line. */
+  function handlerSoFar(at: number): { name: string; text: string } {
+    let start = at;
+    while (start > 0 && !/^\s*const \w+ = useCallback\(/.test(lines[start])) start--;
+    const name = /^\s*const (\w+) = useCallback\(/.exec(lines[start])?.[1] ?? "(no handler)";
+    return { name, text: lines.slice(start, at + 1).join("\n") };
+  }
+
+  const moves = lines.flatMap((line, i) => {
+    const text = line.trim();
+    const comment = text.startsWith("//") || text.startsWith("*") || text.startsWith("/*");
+    return !comment && /\b(setHeadLocal|applyNewHead)\(/.test(line) ? [i] : [];
+  });
+
+  it("finds the places that move the head, so the check below is not vacuous", () => {
+    expect(moves.length).toBeGreaterThan(5);
+  });
+
+  it("every one is in a turn", () => {
+    const outside = moves
+      .map((i) => ({ at: i, ...handlerSoFar(i) }))
+      .filter(({ name, text }) => !NOT_AN_EDIT.includes(name) && !IN_A_TURN.test(text))
+      .map(({ name, at }) => `${name}: ${lines[at].trim()}`);
+    expect(
+      outside,
+      `these adopt a head outside the session's line. Move the adoption into ` +
+        `the turn (inOrder() or applyEdit()), or drop it when the turn ` +
+        `already adopts the head, as loadInOrder() does.`,
+    ).toEqual([]);
   });
 });
