@@ -392,9 +392,11 @@ for the provider that needs it. `LlmProvider::tool_set()` says which:
   `transcribe`) is never selected and never listed: a small model that is
   offered one calls it, and it can only fail. The same goes for the tools
   that only work on a transcript (`NEEDS_TRANSCRIPT_TOOLS`: `cut_words`,
-  `duck_under_speech`, `remove_fillers`), because the only thing that makes
-  a transcript is `transcribe`. A test fails when `transcribe` stops being a
-  stub, and says to delete that list.
+  `remove_fillers`), because the only thing that makes a transcript is
+  `transcribe`. `duck_under_speech` is not one of them: with `voice_tracks` it
+  keys on a track's audio and needs no transcript, and a test fails if a tool
+  with a `voice_tracks` property is put on that list. A test fails when
+  `transcribe` stops being a stub, and says to delete that list.
 
   **The names line.** A model that is not shown a tool does not know it
   exists, so the permitted tools that were not sent are named, names only, in
@@ -619,7 +621,7 @@ impl ToolDispatcher {
 
 There are 93, registered in `ToolDispatcher::default_dispatcher()` with their implementations under `crates/tools/src/tool/`. The full list, with every parameter, is [tools-reference.md](./tools-reference.md) — generated from the registry, so it cannot drift from what the agent can call.
 
-Two of them are stubs: `separate_stems` (Demucs, [#385](https://github.com/laadtushar/edytlab/issues/385)) and `transcribe` (Whisper, [#384](https://github.com/laadtushar/edytlab/issues/384)) return an error in this build. `cut_words`, `remove_fillers`, `duck_under_speech` and the phrase/speech modes of `select_region` need a transcript, which only `transcribe` produces, so they cannot run yet either.
+Two of them are stubs: `separate_stems` (Demucs, [#385](https://github.com/laadtushar/edytlab/issues/385)) and `transcribe` (Whisper, [#384](https://github.com/laadtushar/edytlab/issues/384)) return an error in this build. `cut_words`, `remove_fillers` and the phrase/speech modes of `select_region` need a transcript, which only `transcribe` produces, so they cannot run yet either. `duck_under_speech` does not wait on it: with no transcript it keys on a voice track's audio (`voice_tracks`, found by `speech_detect.rs` from voiced sound, not level).
 
 ### Tool Input/Output Contract
 
