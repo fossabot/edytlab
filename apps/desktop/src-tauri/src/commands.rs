@@ -2177,7 +2177,7 @@ pub fn set_selection_context(state: State<'_, AppState>, range: Option<Range>) -
 /// Also emits a `marker-changed` event so the waveform UI can refresh
 /// its overlay without polling.
 // Off the main thread: it takes the store lock, which a running tool
-// holds for its whole length (#421).
+// can hold for its whole length (#421).
 #[tauri::command(async)]
 pub fn add_marker(
     app: AppHandle,
@@ -2217,7 +2217,7 @@ pub fn add_marker(
 ///
 /// Also emits a `marker-changed` event.
 // Off the main thread: it takes the store lock, which a running tool
-// holds for its whole length (#421).
+// can hold for its whole length (#421).
 #[tauri::command(async)]
 pub fn remove_marker(app: AppHandle, state: State<'_, AppState>, id: String) -> CmdResult<String> {
     let annotation_id = session::AnnotationId(
@@ -2254,7 +2254,7 @@ pub fn cancel_long_running_tool() -> CmdResult<()> {
 /// once. Omitted fields are left alone; a change that changes nothing
 /// appends no node.
 // Off the main thread: it takes the store lock, which a running tool
-// holds for its whole length (#421).
+// can hold for its whole length (#421).
 #[tauri::command(async)]
 pub fn update_marker(
     app: AppHandle,
@@ -2343,7 +2343,7 @@ pub struct TranscriptWordOut {
 /// can say that from an empty list — an error would make "you have not
 /// transcribed yet", which is an ordinary state, look like a fault.
 // Off the main thread: it takes the store lock, which a running tool
-// holds for its whole length (#421).
+// can hold for its whole length (#421).
 #[tauri::command(async)]
 pub fn get_transcript(state: State<'_, AppState>) -> CmdResult<Vec<TranscriptWordOut>> {
     let Some(store_arc) = state.store_handle() else {
@@ -2398,7 +2398,7 @@ pub fn cut_transcript_words(
 /// current session head as a JSON array. Each entry is the serialised
 /// [`session::Annotation`] shape.
 // Off the main thread: it takes the store lock, which a running tool
-// holds for its whole length (#421).
+// can hold for its whole length (#421).
 #[tauri::command(async)]
 pub fn list_markers(state: State<'_, AppState>) -> CmdResult<Vec<serde_json::Value>> {
     let store_arc = state.store_handle().ok_or(CommandError::NoSession)?;
@@ -2435,7 +2435,7 @@ pub fn set_head_to(state: State<'_, AppState>, node_id: String) -> CmdResult<Str
 /// Set or clear a human-readable label on a node. Pass an empty
 /// string to clear. Used by the graph view's "Rename" overlay.
 // Off the main thread: it takes the store lock, which a running tool
-// holds for its whole length (#421).
+// can hold for its whole length (#421).
 #[tauri::command(async)]
 pub fn rename_node(state: State<'_, AppState>, node_id: String, label: String) -> CmdResult<()> {
     let id = session::NodeId::from_hex(&node_id).map_err(CommandError::from)?;
@@ -2499,7 +2499,7 @@ pub struct EnvelopePointSummary {
 /// the frontend Timeline to render per-lane waveforms — without this
 /// every lane fell back to the same mix path.
 // Off the main thread: it takes the store lock, which a running tool
-// holds for its whole length (#421).
+// can hold for its whole length (#421).
 #[tauri::command(async)]
 pub fn list_tracks<R: Runtime>(
     app: AppHandle<R>,
@@ -2808,7 +2808,7 @@ pub(crate) fn set_track_muted_inner(
 /// session rather than of any track — and the toggle has to show the
 /// right state the moment a project opens, not after the first edit.
 // Off the main thread: it takes the store lock, which a running tool
-// holds for its whole length (#421).
+// can hold for its whole length (#421).
 #[tauri::command(async)]
 pub fn get_sync_lock(state: State<'_, AppState>) -> CmdResult<bool> {
     let store_arc = state.store_handle().ok_or(CommandError::NoSession)?;
@@ -4855,6 +4855,52 @@ mod tests {
             state.project_dir.lock().unwrap().as_deref(),
             Some(tmp.path())
         );
+    }
+
+    /// N1 (#421). A tool that runs off the store lock has written its
+    /// output before the node that names it exists, so for that stretch the
+    /// file is an orphan and the sweep an open runs would take it. Opening
+    /// the project again, which the app lets the user do mid-turn, builds a
+    /// fresh `Store`; the count of tools in flight has to be the project's,
+    /// not that handle's.
+    #[test]
+    fn reopening_a_project_while_a_tool_runs_off_the_lock_does_not_sweep_its_output() {
+        let tmp = tempdir().unwrap();
+        let state = AppState::new();
+        open_project_for_test(&state, tmp.path()).unwrap();
+        let handle = state.store_handle().expect("store");
+        handle
+            .lock()
+            .unwrap()
+            .append(session::SessionNode {
+                id: session::NodeId([0u8; 32]),
+                parent: None,
+                created_at: chrono::Utc::now(),
+                label: None,
+                reasoning: None,
+                state: empty_session_state(),
+                op: None,
+            })
+            .unwrap();
+
+        // A tool is running without the lock, and has written its output.
+        let running = handle.lock().unwrap().stage().unwrap();
+        let derived = tools::derived_dir(tmp.path());
+        std::fs::create_dir_all(&derived).unwrap();
+        let output = derived.join("0123abcd-not-yet-named.wav");
+        std::fs::write(&output, b"RIFF-not-yet-named").unwrap();
+
+        open_project_for_test(&state, tmp.path()).unwrap();
+        assert!(
+            output.is_file(),
+            "opening the project again swept the output of a tool that was running"
+        );
+
+        // The deferral is not a leak: once the tool is done the next open
+        // removes what no node names.
+        drop(running);
+        open_project_for_test(&state, tmp.path()).unwrap();
+        assert!(!output.exists(), "the orphan should go once nothing runs");
     }
 
     #[test]

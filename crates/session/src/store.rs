@@ -13,11 +13,29 @@
 //! node file is renamed BEFORE the head file. A crash between the two ends
 //! up with `(old head + new node file orphaned)` — recoverable — and never
 //! `(new head + missing node file)` — corrupt.
+//!
+//! ## Staged handles
+//!
+//! A tool that takes seconds should not hold the store's lock for all of
+//! them (#421). A [`Store`] is only `{ project_dir, head }` over node files
+//! that are written whole and never edited in a way that changes what they
+//! mean, so a long edit can run against a *staged* copy of the handle
+//! ([`Store::stage`]) with no lock held: reads see the shared head as it
+//! was, and appends are kept in memory instead of written. When the edit
+//! is done the staged handle is handed back under the lock
+//! ([`Store::commit`]), which publishes it only if the shared head is still
+//! where the edit started. Node ids hash state alone, so "the head is
+//! where it started" is a comparison of ids, not of anything that can
+//! drift. If the head moved — the user edited meanwhile — nothing is
+//! written, and the caller runs the edit again on the new head.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use tempfile::NamedTempFile;
 
@@ -64,6 +82,85 @@ fn fsync_dir(_path: &Path) -> io::Result<()> {
 pub struct Store {
     project_dir: PathBuf,
     head: Option<NodeId>,
+    /// How many staged handles on this project are alive, from any `Store`
+    /// opened on it in this process. Shared by those stores and every
+    /// handle staged from them, so a sweep holding any one of them can
+    /// tell that an edit is running without the lock (#421). See
+    /// [`in_flight_counter`].
+    in_flight: Arc<AtomicUsize>,
+    /// `Some` for a handle made by [`Store::stage`]: appends go here
+    /// instead of to disk.
+    staged: Option<Staged>,
+}
+
+/// What a staged handle holds instead of writing it.
+struct Staged {
+    /// The head the handle was staged at. [`Store::commit`] publishes only
+    /// if the shared store is still here.
+    base: Option<NodeId>,
+    /// Nodes appended since, in order, one per id.
+    nodes: Vec<SessionNode>,
+    /// Counts this handle in [`Store::staged_in_flight`] for as long as
+    /// it lives, however it ends: committed, dropped, or unwound.
+    _guard: InFlight,
+}
+
+/// The in-flight counter of the project at `project_dir`: one per project
+/// directory in the process, shared by every [`Store`] opened on it.
+///
+/// A counter per `Store::open` would be wrong, because opening is not rare
+/// and not owned by one place: the app builds a new `Store` each time a
+/// project is opened, including the one already open, and sweeps the
+/// derived audio with it before anything else; the background reclaimer
+/// opens a reader of its own. Each would start at zero and delete the
+/// output of a tool another handle has running without the lock (#421, N1).
+/// The alternative, skipping the sweep when the project being opened is the
+/// one already open, would protect that one call site and none of the
+/// others.
+///
+/// Keyed by the canonical path, so `a/../a`, a symlink and a different case
+/// on a case-insensitive disk are one project; the directory exists by the
+/// time this is called (`open` creates it), and if it cannot be resolved the
+/// path as given is the key. The map holds weak references, so a project
+/// nobody has open any more is forgotten rather than counted forever, and a
+/// live handle keeps its project's counter alive.
+fn in_flight_counter(project_dir: &Path) -> Arc<AtomicUsize> {
+    static COUNTERS: OnceLock<Mutex<HashMap<PathBuf, Weak<AtomicUsize>>>> = OnceLock::new();
+    let key = fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
+    // Nothing in here can panic while the lock is held, so a poisoned lock
+    // holds a map that is whole.
+    let mut counters = COUNTERS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    counters.retain(|_, counter| counter.strong_count() > 0);
+    if let Some(counter) = counters.get(&key).and_then(Weak::upgrade) {
+        return counter;
+    }
+    let counter = Arc::new(AtomicUsize::new(0));
+    counters.insert(key, Arc::downgrade(&counter));
+    counter
+}
+
+/// Decrements the shared in-flight count when dropped.
+struct InFlight(Arc<AtomicUsize>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// How [`Store::commit`] ended.
+#[must_use = "a Conflict means nothing was written and the work must be redone"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Commit {
+    /// The staged appends are now in the store, or there were none.
+    Published,
+    /// The store's head moved while the handle was staged, so nothing was
+    /// written. The staged work was done against a state that is no longer
+    /// the head.
+    Conflict,
 }
 
 impl Store {
@@ -75,6 +172,10 @@ impl Store {
     /// rename ordering both rely on no other writer racing inside the
     /// same store directory. Multi-writer locking lands in Phase 3 with
     /// the MCP server.
+    ///
+    /// Staged handles ([`Store::stage`]) keep this assumption: they never
+    /// write, only [`Store::commit`] does, and it takes `&mut self` on the
+    /// one shared store, so there is still one writer at a time.
     pub fn open(project_dir: &Path) -> Result<Self> {
         let store_dir = project_dir.join(STORE_DIR);
         let nodes_dir = store_dir.join(NODES_DIR);
@@ -96,16 +197,154 @@ impl Store {
         Ok(Self {
             project_dir: project_dir.to_path_buf(),
             head,
+            in_flight: in_flight_counter(project_dir),
+            staged: None,
         })
+    }
+
+    /// A handle for running an edit without holding this store's lock
+    /// (#421).
+    ///
+    /// The handle starts at the current head. Reads (`head`, `get`) work as
+    /// on the store itself. `append` moves the handle's head but writes
+    /// nothing: the node is kept in memory until [`Store::commit`]. Writes
+    /// that rewrite history — `set_head`, `set_label`, `remove_node`,
+    /// `detach_parent`, `append_branches`, and so `fork` — are refused with
+    /// [`Error::Staged`], because the shared store cannot be told afterwards
+    /// what they would have done in the middle of someone else's edit.
+    /// `set_op` works on a node the handle appended.
+    ///
+    /// Take the store's lock to call this, and only for this call. The
+    /// handle counts as in flight (see [`Store::staged_in_flight`]) from
+    /// here until it is committed or dropped.
+    pub fn stage(&self) -> Result<Store> {
+        if self.staged.is_some() {
+            return Err(Error::Staged("stage"));
+        }
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        let guard = InFlight(Arc::clone(&self.in_flight));
+        Ok(Store {
+            project_dir: self.project_dir.clone(),
+            head: self.head,
+            in_flight: Arc::clone(&self.in_flight),
+            staged: Some(Staged {
+                base: self.head,
+                nodes: Vec::new(),
+                _guard: guard,
+            }),
+        })
+    }
+
+    /// Whether this is a handle made by [`Store::stage`].
+    pub fn is_staged(&self) -> bool {
+        self.staged.is_some()
+    }
+
+    /// How many staged handles on this project are alive, whichever
+    /// `Store` they were staged from.
+    ///
+    /// Anything that deletes files from the project has to wait while this
+    /// is not zero: a staged edit writes its output before it is
+    /// committed, and until then no node names it. It is incremented in
+    /// [`Store::stage`], which needs the store, so only under the store's
+    /// lock; and decremented when the handle goes — in [`Store::commit`]
+    /// on the normal path, or as a panicking tool unwinds. So a caller
+    /// holding the lock that reads zero knows no staged run can start from
+    /// that store until it lets go, and one that reads more than zero waits.
+    ///
+    /// The count is the project's, not this `Store`'s: every `Store::open`
+    /// on the same directory in this process shares it (see
+    /// [`in_flight_counter`]). The app builds a new `Store` whenever a
+    /// project is opened, including one that is already open, and the
+    /// background reclaimer reads through a handle of its own, so a count
+    /// per `Store` would read zero for exactly the sweeps that can run
+    /// during a tool. What is not shared is the lock: a run staged from an
+    /// older `Store` of the same project, after the app has swapped in a
+    /// newer one, is counted by both, but holding the newer store's lock
+    /// does not stop that older store from staging a new run between a
+    /// sweep's check and its delete.
+    pub fn staged_in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::SeqCst)
+    }
+
+    /// Publish what a staged handle appended, if the head has not moved.
+    ///
+    /// * Nothing appended (a read-only edit, or one that failed before it
+    ///   wrote anything): nothing to do, whatever the head is now.
+    ///   Returns [`Commit::Published`].
+    /// * The head is still where `staged` started: its nodes are written in
+    ///   order — skipping any that already exist, with an `op` the existing
+    ///   record lacks merged in, first writer winning as in
+    ///   [`Store::set_op`] — and the head file is written last. A crash in
+    ///   between leaves the old head and some unreferenced node files, as
+    ///   in [`Store::append`], never a head with a missing node.
+    ///   Returns [`Commit::Published`].
+    /// * The head moved: nothing is written. Returns [`Commit::Conflict`],
+    ///   and the caller runs the edit again on the new head. Comparing ids
+    ///   is exact, and a head that went somewhere and came back is the
+    ///   same state, so it is no conflict.
+    ///
+    /// Consumes `staged`, which stops counting as in flight either way.
+    ///
+    /// Errors, without writing the head, if `self` is itself staged, if
+    /// `staged` is not a staged handle, or if it was staged from another
+    /// project.
+    pub fn commit(&mut self, mut staged: Store) -> Result<Commit> {
+        if self.staged.is_some() {
+            return Err(Error::Staged("commit into a staged store"));
+        }
+        let Some(run) = staged.staged.take() else {
+            return Err(Error::Staged("commit of an unstaged store"));
+        };
+        if staged.project_dir != self.project_dir {
+            return Err(Error::Staged("commit into another project"));
+        }
+        if run.nodes.is_empty() {
+            return Ok(Commit::Published);
+        }
+        if self.head != run.base {
+            return Ok(Commit::Conflict);
+        }
+
+        for node in &run.nodes {
+            let hex = node.id.to_hex();
+            let exists = self.shard_dir(&hex).join(format!("{hex}.json")).exists();
+            if !exists {
+                self.write_node_idempotent(node)?;
+            } else if let Some(op) = node.op.clone() {
+                // The node is already there, from an earlier route to the
+                // same state. Its record stands, unless it has none.
+                self.set_op(node.id, op)?;
+            }
+        }
+        if let Some(head) = staged.head {
+            self.write_head_atomic(head)?;
+            self.head = Some(head);
+        }
+        Ok(Commit::Published)
     }
 
     /// Append a node to the linear history. The caller's `parent` and `id`
     /// fields are overwritten: `parent` becomes the current head, `id` is
     /// recomputed from `state`.
+    ///
+    /// On a staged handle the node is kept in memory instead of written
+    /// (see [`Store::stage`]).
     pub fn append(&mut self, mut node: SessionNode) -> Result<NodeId> {
         node.parent = self.head;
         node.id = NodeId::from_state(&node.state)?;
         let id = node.id;
+
+        if let Some(run) = self.staged.as_mut() {
+            // One entry per id, the first: as on disk, where a state
+            // reached twice keeps the parent it had the first time. Whether
+            // the file is already there is decided at commit.
+            if !run.nodes.iter().any(|n| n.id == id) {
+                run.nodes.push(node);
+            }
+            self.head = Some(id);
+            return Ok(id);
+        }
 
         let hex = id.to_hex();
         let shard_dir = self.shard_dir(&hex);
@@ -233,6 +472,9 @@ impl Store {
     /// A node that is already gone is not an error — a compaction
     /// interrupted halfway can be run again.
     pub fn remove_node(&mut self, id: NodeId) -> Result<bool> {
+        if self.staged.is_some() {
+            return Err(Error::Staged("remove_node"));
+        }
         let hex = id.to_hex();
         let path = self.shard_dir(&hex).join(format!("{hex}.json"));
         if !path.exists() {
@@ -255,6 +497,9 @@ impl Store {
     /// `parent` is metadata the store maintains, so rewriting it does
     /// not change what the node is or where it lives on disk.
     pub fn detach_parent(&mut self, id: NodeId) -> Result<()> {
+        if self.staged.is_some() {
+            return Err(Error::Staged("detach_parent"));
+        }
         let mut node = self.get(id)?;
         if node.parent.is_none() {
             return Ok(());
@@ -275,8 +520,18 @@ impl Store {
     pub fn get(&self, id: NodeId) -> Result<SessionNode> {
         let hex = id.to_hex();
         let path = self.shard_dir(&hex).join(format!("{hex}.json"));
+        // What a staged handle appended, if this is one and it did.
+        let appended = self
+            .staged
+            .as_ref()
+            .and_then(|run| run.nodes.iter().find(|n| n.id == id));
         if !path.exists() {
-            return Err(Error::NodeNotFound(hex));
+            // Not on disk: the staged copy is the only record, and is what
+            // the commit will write.
+            return match appended {
+                Some(node) => Ok(node.clone()),
+                None => Err(Error::NodeNotFound(hex)),
+            };
         }
         let bytes = fs::read(&path)?;
         let mut node: SessionNode = serde_json::from_slice(&bytes)?;
@@ -284,6 +539,18 @@ impl Store {
         // under paths the nodes do not name. See `crate::relocate`; in a
         // project that has not moved this does nothing.
         crate::relocate::rebind(&mut node.state, &self.project_dir);
+        // A node a staged run appended that is on disk already — a state
+        // reached again, which is a node ids hash state alone — stands as
+        // the file has it, parent included, exactly as `append` leaves it
+        // on the shared store: the file is not rewritten. The run's own
+        // copy has the parent the run had when it got there, which for an
+        // edit that changed nothing is the node itself. The one thing the
+        // commit adds to such a file is an `op` it lacks, so that shows.
+        if let Some(appended) = appended {
+            if node.op.is_none() {
+                node.op = appended.op.clone();
+            }
+        }
         Ok(node)
     }
 
@@ -311,7 +578,24 @@ impl Store {
     /// This is an O(N) directory scan; M25's frontend graph view caps
     /// the working set at 200 nodes so the cost is bounded. Phase 3
     /// will likely switch to an in-memory index for larger sessions.
+    ///
+    /// On a staged handle the nodes it appended and that are not on disk
+    /// yet are included.
     pub fn list_nodes(&self) -> Result<Vec<SessionNode>> {
+        let mut out = self.list_disk_nodes()?;
+        if let Some(run) = self.staged.as_ref() {
+            let on_disk: std::collections::HashSet<NodeId> = out.iter().map(|n| n.id).collect();
+            out.extend(
+                run.nodes
+                    .iter()
+                    .filter(|n| !on_disk.contains(&n.id))
+                    .cloned(),
+            );
+        }
+        Ok(out)
+    }
+
+    fn list_disk_nodes(&self) -> Result<Vec<SessionNode>> {
         let nodes_dir = self.project_dir.join(STORE_DIR).join(NODES_DIR);
         if !nodes_dir.exists() {
             return Ok(Vec::new());
@@ -338,6 +622,9 @@ impl Store {
     }
 
     pub fn set_head(&mut self, id: NodeId) -> Result<()> {
+        if self.staged.is_some() {
+            return Err(Error::Staged("set_head"));
+        }
         let hex = id.to_hex();
         let path = self.shard_dir(&hex).join(format!("{hex}.json"));
         if !path.exists() {
@@ -388,6 +675,9 @@ impl Store {
     /// rewritten atomically via the same tempfile-then-rename pattern
     /// as `append`.
     pub fn set_label(&mut self, id: NodeId, label: Option<String>) -> Result<()> {
+        if self.staged.is_some() {
+            return Err(Error::Staged("set_label"));
+        }
         let mut node = self.get(id)?;
         node.label = label;
         self.write_node_overwrite(&node)?;
@@ -405,7 +695,22 @@ impl Store {
     /// existing record describes the run that actually produced the file
     /// on disk, and overwriting it with a later, equivalent derivation
     /// would trade a fact for a guess.
+    ///
+    /// On a staged handle this applies to a node the handle appended, in
+    /// memory, and lands with [`Store::commit`]. Any other node is refused:
+    /// the handle holds no lock, so it must not rewrite files.
     pub fn set_op(&mut self, id: NodeId, op: crate::node::NodeOp) -> Result<()> {
+        if let Some(run) = self.staged.as_mut() {
+            let Some(node) = run.nodes.iter_mut().find(|n| n.id == id) else {
+                return Err(Error::Staged(
+                    "set_op on a node the staged run did not append",
+                ));
+            };
+            if node.op.is_none() {
+                node.op = Some(op);
+            }
+            return Ok(());
+        }
         let mut node = self.get(id)?;
         if node.op.is_some() {
             return Ok(());
@@ -431,6 +736,9 @@ impl Store {
         parent: NodeId,
         states: Vec<(SessionState, Option<String>)>,
     ) -> Result<Vec<NodeId>> {
+        if self.staged.is_some() {
+            return Err(Error::Staged("append_branches"));
+        }
         if states.is_empty() {
             return Ok(Vec::new());
         }
