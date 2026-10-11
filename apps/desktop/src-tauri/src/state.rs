@@ -29,6 +29,8 @@ use session::Store;
 use skills::SkillLibrary;
 use tools::{Range, ToolDispatcher};
 
+use crate::live_stores::LiveStores;
+
 /// Shared, mutex-guarded application state. Cloning is cheap (`Arc`).
 #[derive(Clone)]
 pub struct AppState {
@@ -42,6 +44,12 @@ pub struct AppState {
     /// `Arc<Mutex<Store>>` so the same handle can be shared with the
     /// agent (which expects a non-`Option` `Arc<Mutex<Store>>`).
     pub store: Arc<Mutex<Option<Arc<Mutex<Store>>>>>,
+    /// Every store that is still alive, by project folder (#501). The one
+    /// in [`AppState::store`] is among them, and so is the one a running
+    /// turn holds after the window has moved to another project. A store
+    /// put in `store` must come from here (`LiveStores::register`), or an
+    /// open of its folder could not find it and would build a second.
+    pub live_stores: LiveStores,
     /// Audio engine. Stateless in Phase 1 but wrapped in `Arc<Mutex<_>>`
     /// to match the type the agent and tools expect.
     pub engine: Arc<Mutex<Engine>>,
@@ -173,6 +181,7 @@ impl AppState {
             agent: Arc::new(tokio::sync::Mutex::new(None)),
             dispatcher: Arc::new(Mutex::new(ToolDispatcher::default_dispatcher())),
             store: Arc::new(Mutex::new(None)),
+            live_stores: LiveStores::default(),
             engine: Arc::new(Mutex::new(Engine::new())),
             project_dir: Arc::new(Mutex::new(None)),
             api_key: Arc::new(Mutex::new(None)),
@@ -521,14 +530,19 @@ impl AppState {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Replace the open store with `handle`. Pass `None` to clear it.
-    pub fn set_store(&self, handle: Option<Arc<Mutex<Store>>>) {
-        *self.store.lock().expect("store mutex poisoned") = handle;
-    }
-
-    /// Replace the project directory.
-    pub fn set_project_dir(&self, dir: Option<PathBuf>) {
-        *self.project_dir.lock().expect("project_dir mutex poisoned") = dir;
+    /// Make `store` the open project's store and `dir` its directory.
+    ///
+    /// `store` is the project's live store: the one
+    /// [`AppState::live_stores`] gave out or took in for its folder.
+    ///
+    /// The two are written together, holding the `store` slot's lock for
+    /// both, so a reader that sees the new store sees the new directory
+    /// too. The order is the `store` slot, then the `project_dir` slot; no
+    /// code takes them the other way round.
+    pub fn set_open_project(&self, store: Arc<Mutex<Store>>, dir: PathBuf) {
+        let mut slot = self.store.lock().expect("store mutex poisoned");
+        *slot = Some(store);
+        *self.project_dir.lock().expect("project_dir mutex poisoned") = Some(dir);
     }
 
     /// Snapshot the model id selected for `provider_id`, if any.
