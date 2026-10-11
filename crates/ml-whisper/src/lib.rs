@@ -41,6 +41,7 @@
 //!   real decoder must uphold.
 
 pub mod mel;
+pub mod tokenizer;
 
 use std::path::Path;
 
