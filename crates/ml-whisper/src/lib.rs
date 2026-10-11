@@ -40,6 +40,7 @@
 //!   not a CI gate. See `tests/transcribe_smoke.rs` for the contract the
 //!   real decoder must uphold.
 
+pub mod decode;
 pub mod mel;
 pub mod tokenizer;
 
