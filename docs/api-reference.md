@@ -338,6 +338,12 @@ read. That is not `null`: a caller that saved the blank it took for "no
 override" would delete the one that is stored, which is what Settings did
 after a startup the keychain refused.
 
+After a startup the keychain refused (a locked keyring, a dismissed unlock
+prompt) it rejects without reading, saying so: each read of a locked keyring
+is another unlock prompt, and Settings asks for this the moment it opens. The
+refusal lifts with the first save that goes through. Pending, like `hasApiKey`,
+while the launch-time reads are still going.
+
 ---
 
 ### `defaultBaseUrlFor(provider: ProviderId) → string`
@@ -361,7 +367,8 @@ default applies. Only Anthropic has the setting, so any other provider answers
 `null`.
 
 **Throws:** Error string (the reason alone) when the keychain could not be
-read, as `getBaseUrlFor` does, and for the same reason.
+read, as `getBaseUrlFor` does, and for the same reason. Like it, rejects
+without reading after a startup the keychain refused.
 
 ---
 
@@ -394,6 +401,11 @@ Live results are cached for 10 minutes, per provider, endpoint and key.
 - `provider` — provider to query
 - `apiKey` — optional key override (uses stored key if omitted)
 
+**Throws:** Error string after a startup the keychain refused, without
+reading it: the stored key and base URL are both keychain reads, and a list
+fetched with a guessed endpoint is not the list of the server chat talks to.
+Pending, like `hasApiKey`, while the launch-time reads are still going.
+
 **Returns:** `ModelCatalogue`
 ```typescript
 interface ModelCatalogue {
@@ -421,7 +433,16 @@ const { models, source } = await bridge.listModelsFor("anthropic");
 
 ### `getActiveModel(provider: ProviderId) → string`
 
-Returns the model ID currently selected for the provider.
+Returns the model ID currently selected for the provider, or an empty string
+when none has been chosen.
+
+**Throws:** Error string when the app's launch-time keychain reads could not
+restore the chosen models (a locked keyring, a dismissed unlock prompt) and
+nothing is known for this provider. That is not the empty string: "none
+chosen" would be what the map lacks, not what the keychain says, and a caller
+that saved the model it showed would overwrite the stored one. A model chosen
+since, or restored before the refusal, is still answered. Pending, like
+`hasApiKey`, while the launch-time reads are still going.
 
 ### `setActiveModel(provider: ProviderId, model: string) → void`
 
