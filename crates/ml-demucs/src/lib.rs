@@ -38,6 +38,12 @@
 //! It used to return `Ok(Vec::new())` — an empty transcript reported as
 //! success — which was worse, and is gone.
 //!
+//! One piece of the decoder exists ahead of the rest: [`separate`], the
+//! segment and overlap-add pipeline around the network, behind a
+//! [`separate::SegmentModel`] trait and tested with a fake model. Nothing
+//! implements that trait with ONNX Runtime yet, so
+//! [`DemucsModel::separate`] is as unimplemented as before (#385).
+//!
 //! ## Cache layout
 //!
 //! `<project>/.audiograph/stem-cache/<hex>/{vocals,drums,bass,other}.wav`
@@ -73,6 +79,8 @@ mod cache;
 pub mod spec;
 
 pub use cache::{stem_dir_for, write_stems_to_dir, StemPaths, STEM_FILENAMES, STEM_NAMES};
+
+pub mod separate;
 
 /// One separated stem in the same shape as [`DecodedAudio`].
 ///
@@ -140,6 +148,12 @@ pub enum DemucsError {
 
     #[error("WAV writer error: {0}")]
     Wav(String),
+
+    /// The segment pipeline ([`separate`]) was given a [`separate::SegmentModel`]
+    /// it cannot use: no segment size or sources, or a result of the wrong
+    /// shape. A bug in the model wrapper, not in the audio or the runtime.
+    #[error("stem separation pipeline: {0}")]
+    Pipeline(String),
 
     /// Real inference is gated on M28 wiring the ORT decode loop. The
     /// tool layer surfaces this as a `ToolResult::Error`.
