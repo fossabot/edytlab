@@ -35,7 +35,9 @@
 //!    zero; [`apply_compaction`] refuses, and changes nothing. Save As holds
 //!    a staged handle too, writing nothing, while it copies the project's
 //!    audio with no lock held, so that nothing the copied nodes name is
-//!    deleted under the copy (#571). The count is the project's, shared by
+//!    deleted under the copy (#571), and so does the copy of a project's
+//!    audio into it from the project it was copied from, as it opens
+//!    ([`crate::repair`], #612). The count is the project's, shared by
 //!    every `Store` opened on the directory in this process, so a sweep
 //!    through a freshly opened handle (a project opened again, the
 //!    reclaimer's reader) sees a run staged from another. The sweep runs
@@ -511,6 +513,13 @@ impl Verifier {
 /// lists count as naming theirs. Otherwise every flattened copy would be
 /// taken for an orphan, including the one the timeline is showing.
 ///
+/// What a node names is what the store reads back. In a copy of a project
+/// (Save As, or a folder copied by hand) the node files name the
+/// original's files, and the store reads them as the copy's own files of
+/// the same names (`session::relocate`), so the copy's audio is named, and
+/// kept, while the original is still there (#612). The same goes for every
+/// sweep here and for compaction, which list nodes through the store too.
+///
 /// Not the history sweep. [`sweep`] also removes audio only older nodes
 /// name, once a replay has rebuilt it; review of #98 proved that record
 /// alone was not enough for five kinds of history (after
@@ -522,23 +531,44 @@ pub fn sweep_orphans(store: &session::Store) -> std::io::Result<SweepReport> {
     if store.staged_in_flight() > 0 {
         return Ok(SweepReport::default());
     }
+    if !derived_dir(store.project_dir()).is_dir() {
+        return Ok(SweepReport::default());
+    }
+
+    // A store whose nodes could not be read names nothing, and sweeping it
+    // would empty the directory.
+    let Ok(nodes) = store.list_nodes() else {
+        return Ok(SweepReport::default());
+    };
+    sweep_orphans_listed(store, &nodes)
+}
+
+/// [`sweep_orphans`] for the nodes the caller has listed from `store`,
+/// under the same lock: opening a project lists them once, for this and
+/// for planning the repair of a copy (`crate::repair`). A caller whose
+/// listing failed does not call this: a store whose nodes could not be
+/// read names nothing, and sweeping it would empty the directory.
+pub fn sweep_orphans_listed(
+    store: &session::Store,
+    nodes: &[session::SessionNode],
+) -> std::io::Result<SweepReport> {
+    // Rule 0: not while a tool runs without the lock.
+    if store.staged_in_flight() > 0 {
+        return Ok(SweepReport::default());
+    }
     let dir = derived_dir(store.project_dir());
     if !dir.is_dir() {
         return Ok(SweepReport::default());
     }
 
-    // A store whose nodes could not be read names nothing, and sweeping it
-    // would empty the directory. Only a store that really has no history
-    // may have everything in `derived/` counted as unnamed — and a head
-    // with no nodes behind it is not that.
-    let Ok(nodes) = store.list_nodes() else {
-        return Ok(SweepReport::default());
-    };
+    // Only a store that really has no history may have everything in
+    // `derived/` counted as unnamed — and a head with no nodes behind it is
+    // not that.
     if nodes.is_empty() && store.head().is_some() {
         return Ok(SweepReport::default());
     }
-    let mut named = all_refs(&nodes);
-    named.extend(lane_copies(store.project_dir(), &nodes));
+    let mut named = all_refs(nodes);
+    named.extend(lane_copies(store.project_dir(), nodes));
 
     let mut report = SweepReport::default();
     for entry in std::fs::read_dir(&dir)? {
@@ -738,8 +768,10 @@ pub fn plan_compaction(
 ///
 /// Refused, with nothing changed, while a staged handle on the project is
 /// alive (rule 0): a tool running off the lock may be reading audio this
-/// would delete, and Save As, which keeps one for the length of its copy,
-/// has copied the nodes this removes and is copying the audio they name.
+/// would delete, Save As, which keeps one for the length of its copy, has
+/// copied the nodes this removes and is copying the audio they name, and a
+/// copy of a project's audio into it as it opens ([`crate::repair`]) is
+/// adding files these nodes name.
 pub fn apply_compaction(
     store: &mut session::Store,
     plan: &CompactionPlan,
@@ -747,7 +779,8 @@ pub fn apply_compaction(
     if store.staged_in_flight() > 0 {
         return Err(
             "nothing was compacted: the project's files are in use without the \
-                    session's lock (an edit still running, or Save As copying the project); \
+                    session's lock (an edit still running, Save As copying the project, or \
+                    audio being copied in from the project this one was copied from); \
                     try again when it has finished"
                 .to_string(),
         );

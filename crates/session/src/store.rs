@@ -110,6 +110,11 @@ pub struct Store {
     /// `Some` for a handle made by [`Store::stage`]: appends go here
     /// instead of to disk.
     staged: Option<Staged>,
+    /// How a node read from this project's files names its audio, when the
+    /// project was copied or moved (`crate::relocate`). Kept for as long as
+    /// the store is open, so what it works out about a folder is worked out
+    /// once, and shared with the handles staged from it.
+    rebinder: Arc<crate::relocate::Rebinder>,
 }
 
 /// What a staged handle holds instead of writing it.
@@ -220,6 +225,7 @@ impl Store {
             head,
             in_flight: in_flight_counter(project_dir),
             staged: None,
+            rebinder: Arc::new(crate::relocate::Rebinder::new(project_dir)),
         })
     }
 
@@ -230,7 +236,8 @@ impl Store {
     /// on the store itself. `append` moves the handle's head but writes
     /// nothing: the node is kept in memory until [`Store::commit`]. Writes
     /// that rewrite history — `set_head`, `set_label`, `remove_node`,
-    /// `detach_parent`, `append_branches`, and so `fork` — are refused with
+    /// `detach_parent`, `append_branches`, and so `fork` and `revert_to` —
+    /// are refused with
     /// [`Error::Staged`], because the shared store cannot be told afterwards
     /// what they would have done in the middle of someone else's edit.
     /// `set_op` works on a node the handle appended.
@@ -253,6 +260,7 @@ impl Store {
                 nodes: Vec::new(),
                 _guard: guard,
             }),
+            rebinder: Arc::clone(&self.rebinder),
         })
     }
 
@@ -559,9 +567,11 @@ impl Store {
         let bytes = fs::read(&path)?;
         let mut node: SessionNode = serde_json::from_slice(&bytes)?;
         // A project that has been copied or moved holds its own audio
-        // under paths the nodes do not name. See `crate::relocate`; in a
-        // project that has not moved this does nothing.
-        crate::relocate::rebind(&mut node.state, &self.project_dir);
+        // under paths the nodes do not name, and reads it, not the folder
+        // it came from, whether or not that is still there (#612). See
+        // `crate::relocate`; in a project that has not been copied or moved
+        // this does nothing.
+        self.rebinder.rebind(&mut node.state);
         // A node a staged run appended that is on disk already — a state
         // reached again, which is a node ids hash state alone — stands as
         // the file has it, parent included, exactly as `append` leaves it
@@ -580,6 +590,15 @@ impl Store {
     /// Current head, or `None` if the store has no nodes yet.
     pub fn head(&self) -> Option<NodeId> {
         self.head
+    }
+
+    /// Where this project keeps the file `path` names, if `path` is a file
+    /// in a content-named folder of another project (see
+    /// [`crate::relocate::Rebinder::counterpart`]): where a rebuild puts a
+    /// gone file of another project's `derived/`, and where the repair of a
+    /// copy copies the original's files to.
+    pub fn counterpart(&self, path: &Path) -> Option<PathBuf> {
+        self.rebinder.counterpart(path)
     }
 
     /// Project directory the store was opened against. Tools that
@@ -637,7 +656,7 @@ impl Store {
                 }
                 let bytes = fs::read(&path)?;
                 let mut node: SessionNode = serde_json::from_slice(&bytes)?;
-                crate::relocate::rebind(&mut node.state, &self.project_dir);
+                self.rebinder.rebind(&mut node.state);
                 out.push(node);
             }
         }
@@ -680,14 +699,14 @@ impl Store {
         diff::merge(self, a, b)
     }
 
-    /// Move head to a node whose state matches `target`.
+    /// Move head to `target`.
     ///
-    /// Node ids hash the state alone, so appending `target`'s state lands
-    /// on `target` itself: the result is `target`, still parented to
-    /// whatever it was parented to when first reached (see
-    /// [`Store::append`]). Nothing is added and every node after it is
-    /// kept, so no history is lost; what is not recorded is the route
-    /// that led here.
+    /// The result is `target`, still parented to whatever it was parented
+    /// to when first reached. Nothing is added and every node after it is
+    /// kept, so no history is lost; what is not recorded is the route that
+    /// led here. That holds in a copied or moved project too, where
+    /// `target` reads with paths its id was not hashed from, so appending
+    /// its state would not land on it (see [`crate::diff::revert_to`]).
     pub fn revert_to(&mut self, target: NodeId) -> Result<NodeId> {
         diff::revert_to(self, target)
     }
