@@ -25,11 +25,9 @@ use ai::Agent;
 use audio_engine::Engine;
 use mcp::{McpConfig, McpRegistry};
 use memory::MemoryStore;
-use session::Store;
+use session::{LiveStore, Store};
 use skills::SkillLibrary;
 use tools::{Range, ToolDispatcher};
-
-use crate::live_stores::LiveStores;
 
 /// Shared, mutex-guarded application state. Cloning is cheap (`Arc`).
 #[derive(Clone)]
@@ -40,16 +38,18 @@ pub struct AppState {
     /// Tool dispatcher (Phase 1 default tool set). Constructed once at
     /// boot; never replaced.
     pub dispatcher: Arc<Mutex<ToolDispatcher>>,
-    /// Session store. `None` until `open_project` is called. Wrapped in
-    /// `Arc<Mutex<Store>>` so the same handle can be shared with the
-    /// agent (which expects a non-`Option` `Arc<Mutex<Store>>`).
-    pub store: Arc<Mutex<Option<Arc<Mutex<Store>>>>>,
-    /// Every store that is still alive, by project folder (#501). The one
-    /// in [`AppState::store`] is among them, and so is the one a running
-    /// turn holds after the window has moved to another project. A store
-    /// put in `store` must come from here (`LiveStores::register`), or an
-    /// open of its folder could not find it and would build a second.
-    pub live_stores: LiveStores,
+    /// Session store. `None` until `open_project` is called. A
+    /// [`LiveStore`], which only the registry in `session` makes, so a store
+    /// that is not the one live for its folder cannot be put here (#566): a
+    /// project opened again later, or by a tool, finds this one and does not
+    /// build a second writer on the folder. It is `Arc<Mutex<Store>>`
+    /// underneath, shared with the agent (which expects a non-`Option`
+    /// `Arc<Mutex<Store>>`: see [`AppState::store_handle`]).
+    ///
+    /// The registry also holds the stores that are alive but not here, such
+    /// as the one a running turn keeps after the window has moved to another
+    /// project (#501).
+    pub store: Arc<Mutex<Option<LiveStore>>>,
     /// Audio engine. Stateless in Phase 1 but wrapped in `Arc<Mutex<_>>`
     /// to match the type the agent and tools expect.
     pub engine: Arc<Mutex<Engine>>,
@@ -204,7 +204,6 @@ impl AppState {
             agent: Arc::new(tokio::sync::Mutex::new(None)),
             dispatcher: Arc::new(Mutex::new(ToolDispatcher::default_dispatcher())),
             store: Arc::new(Mutex::new(None)),
-            live_stores: LiveStores::default(),
             engine: Arc::new(Mutex::new(Engine::new())),
             project_dir: Arc::new(Mutex::new(None)),
             api_key: Arc::new(Mutex::new(None)),
@@ -524,7 +523,7 @@ impl AppState {
             .lock()
             .expect("store mutex poisoned")
             .as_ref()
-            .map(Arc::clone)
+            .map(LiveStore::handle)
     }
 
     /// Snapshot the currently-cached API key, if any.
@@ -598,29 +597,65 @@ impl AppState {
 
     /// Make `store` the open project's store and `dir` its directory.
     ///
-    /// `store` is the project's live store: the one
-    /// [`AppState::live_stores`] gave out or took in for its folder.
+    /// `store` is the project's live store, as `session::Store::open_shared`
+    /// gave it out. Nothing else is accepted: a [`LiveStore`] is made only
+    /// by the registry, so an open of the folder later finds this store while
+    /// anything holds it instead of building another (#566).
     ///
     /// The two are written together, holding the `store` slot's lock for
     /// both, so a reader that sees the new store sees the new directory
     /// too. The order is the `store` slot, then the `project_dir` slot; no
     /// code takes them the other way round.
-    pub fn set_open_project(&self, store: Arc<Mutex<Store>>, dir: PathBuf) {
+    pub fn set_open_project(&self, store: LiveStore, dir: PathBuf) {
         {
             let mut slot = self.store.lock().expect("store mutex poisoned");
             *slot = Some(store);
             *self.project_dir.lock().expect("project_dir mutex poisoned") = Some(dir);
         }
-        // The window's mix is one of the project that was open, and the
-        // window starts over with the new one (#607). Taken with the slots
-        // above released, and dropped with its own lock released too: a
-        // hold's drop evicts the old project's cache back under its cap.
+        self.release_window_mix();
+    }
+
+    /// The window's mix is one of a project that is no longer the open one,
+    /// and the window starts over (#607). Called with no other lock held,
+    /// slots included, and the hold is dropped with the window-mix lock
+    /// released too: a hold's drop evicts the old project's cache back under
+    /// its cap.
+    pub fn release_window_mix(&self) {
         let released = self
             .window_mix
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .release();
         drop(released);
+    }
+
+    /// Let go of the open project if its store is `stale` and nothing else
+    /// holds that store, and say whether it did (#566).
+    ///
+    /// For a project whose folder was replaced at the same path: the store
+    /// is of the old folder, and a new one cannot be opened for the path
+    /// while it lives. `others` is how many handles besides this slot's and
+    /// the caller's own `stale` the caller expects (the idle agent's, which
+    /// it is about to drop). Any more than that is a command, a reader or a
+    /// turn using the store, and then nothing is changed.
+    ///
+    /// The count is taken with the `store` slot's lock held, which every
+    /// `store_handle()` takes to clone, so no new handle can appear between
+    /// the count and the release. The two slots are written together, in the
+    /// order [`AppState::set_open_project`] takes them. The window's mix is
+    /// not touched here, because its lock is taken alone: the caller releases
+    /// it ([`AppState::release_window_mix`]) once it holds no lock.
+    pub fn release_open_project_if_exclusive(&self, stale: &LiveStore, others: usize) -> bool {
+        let mut slot = self.store.lock().expect("store mutex poisoned");
+        let Some(held) = slot.as_ref() else {
+            return false;
+        };
+        if !held.ptr_eq(stale) || Arc::strong_count(held.as_arc()) != 2 + others {
+            return false;
+        }
+        *slot = None;
+        *self.project_dir.lock().expect("project_dir mutex poisoned") = None;
+        true
     }
 
     /// Snapshot the model id selected for `provider_id`, if any.
