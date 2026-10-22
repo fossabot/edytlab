@@ -3,10 +3,12 @@
 
 `tests/transcribe_known_words.rs` needs speech with word times that are exact,
 and a licence that is clean. This builds both from synthesis instead of from a
-recording: each word is spoken on its own by `espeak-ng` (GPL-3.0-or-later;
-the *output* of a speech synthesiser is not a work of the program, and no
-third-party recording, voice or text is in the file), cut down to the part
+recording: each word is spoken on its own by `espeak-ng`, cut down to the part
 that is sound, and placed at a chosen time with chosen silence around it.
+`espeak-ng` is GPL-3.0-or-later. The WAV is its output for twelve words of
+the script's own choosing, not a copy of its code or data, and no third-party
+recording, voice sample or text is in it; whether that is as clean as an
+owner's own recording is the repository owner's call (flagged in the PR).
 Because the script puts every word where it says, `speech_words.json` is not
 a hand label with an error of its own: it is the construction.
 
