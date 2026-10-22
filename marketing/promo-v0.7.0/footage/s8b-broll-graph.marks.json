@@ -1,10 +1,14 @@
 [
   {
-    "label": "drag starts",
-    "t": 4.2
+    "label": "start",
+    "t": 0
   },
   {
-    "label": "drag ends",
-    "t": 11.07
+    "label": "wheel",
+    "t": 1.5
+  },
+  {
+    "label": "drag",
+    "t": 5.56
   }
 ]

@@ -1,19 +1,36 @@
 {
+  "live": true,
+  "model": null,
+  "effort": null,
+  "nodes": 20,
+  "assistant": "none in this shot",
   "file": "s8b-broll-graph.mp4",
-  "seconds": 13.067,
-  "frames": 392,
-  "captured": 202,
+  "seconds": 20.4,
+  "frames": 306,
+  "fps": 15,
+  "size": "3200x2000",
   "marks": [
     {
-      "label": "drag starts",
-      "t": 4.2
+      "label": "start",
+      "t": 0
     },
     {
-      "label": "drag ends",
-      "t": 11.07
+      "label": "wheel",
+      "t": 1.5
+    },
+    {
+      "label": "drag",
+      "t": 5.56
     }
   ],
-  "spans": [],
-  "nodes": 17,
-  "crop": "left pane: x 0..1240, y 52..972 (CSS px)"
+  "wav": null,
+  "spans": null,
+  "sync": null,
+  "capture": {
+    "frames": 338,
+    "dup": 0,
+    "drop": 5,
+    "speed": 0.997
+  },
+  "toolCalls": null
 }

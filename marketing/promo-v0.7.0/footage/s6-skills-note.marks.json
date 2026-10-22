@@ -1,10 +1,18 @@
 [
   {
+    "label": "start",
+    "t": 0
+  },
+  {
+    "label": "skills tab",
+    "t": 5.33
+  },
+  {
     "label": "bundled note shown",
-    "t": 4
+    "t": 7.27
   },
   {
     "label": "a skill opened",
-    "t": 8.97
+    "t": 12.21
   }
 ]

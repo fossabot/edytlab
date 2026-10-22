@@ -1,10 +1,18 @@
 [
   {
-    "label": "pan starts",
-    "t": 3.13
+    "label": "start",
+    "t": 0
   },
   {
-    "label": "pan ends",
-    "t": 10.33
+    "label": "zoom",
+    "t": 1.5
+  },
+  {
+    "label": "pan",
+    "t": 8.01
+  },
+  {
+    "label": "lanes",
+    "t": 17.69
   }
 ]

@@ -1,25 +1,42 @@
 {
+  "live": true,
+  "model": null,
+  "effort": null,
+  "text": "ONNX Runtime: 1.23.2 (bundled)",
+  "detail": "/tmp/edytlab-v0.7.0/usr/lib/edytlab/libonnxruntime.so",
+  "scrolledPx": 0,
+  "assistant": "none in this shot",
   "file": "s5-runtime-bundled.mp4",
-  "seconds": 7.2,
-  "frames": 216,
-  "captured": 59,
+  "seconds": 12.27,
+  "frames": 184,
+  "fps": 15,
+  "size": "3200x2000",
   "marks": [
     {
-      "label": "settings opening",
-      "t": 2
+      "label": "start",
+      "t": 0
+    },
+    {
+      "label": "gear",
+      "t": 1.5
+    },
+    {
+      "label": "settings open",
+      "t": 3.67
     },
     {
       "label": "runtime line in view",
-      "t": 4
+      "t": 5.15
     }
   ],
-  "spans": [],
-  "status": {
-    "state": "found",
-    "version": "1.23.2",
-    "path": "/usr/lib/edytlab/libonnxruntime.so",
-    "source": "bundled"
+  "wav": null,
+  "spans": null,
+  "sync": null,
+  "capture": {
+    "frames": 203,
+    "dup": 0,
+    "drop": 17,
+    "speed": 1.04
   },
-  "text": "ONNX Runtime: 1.23.2 (bundled)",
-  "scrolledPx": 0
+  "toolCalls": null
 }

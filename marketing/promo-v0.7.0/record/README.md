@@ -1,59 +1,71 @@
-# Recording harness for the v0.7.0 promo footage
+# Recording the v0.7.0 promo footage live
 
-Scripts that drive the **real frontend** (`apps/desktop/src`, built for production, with only the IPC boundary
-replaced, exactly as the e2e suite runs it) and record it. Nothing here is part of the app's tests: the app's
-`playwright.config.ts` has `testDir: "./e2e"`, so `test:e2e` and CI never see this folder.
+The footage in `../footage/` is the released v0.7.0 app driven by real Claude. The stories that drive it are
+`apps/desktop/e2e-native/stories/promo.mjs` (with `promo-audio.mjs`) and they run in the native suite, which drives the real
+desktop binary over WebDriver (`apps/desktop/e2e-native/`). `make-footage.mjs` in this folder cuts what they leave behind into
+the clips. The scripted footage's Playwright recorder is in `../../archive/promo-v0.7.0/2026-10-22-scripted/record/`.
+
+## What you need
+
+Linux with Xvfb, openbox, tauri-driver, WebKitWebDriver, xdotool, ffmpeg and PulseAudio. The app: the release's `.deb`
+(`gh api repos/laadtushar/edytlab/releases/tags/v0.7.0`), unpacked with `dpkg-deb -x edytlab_0.7.0_amd64.deb <dir>`; its
+binary is `<dir>/usr/bin/edytlab-desktop` and finds its resources (`<dir>/usr/lib/edytlab/`: the ONNX Runtime, templates,
+bundled skills) beside it. Unpack it to a short path: Settings prints where it found the runtime.
+
+An audio sink to capture, started once:
 
 ```bash
-cd apps/desktop
-pnpm install --frozen-lockfile
-# one shot (the name is matched against the file name), or leave it out for all of them
-PROMO_PORT=5311 pnpm exec playwright test -c ../../marketing/promo-v0.7.0/record/playwright.config.ts s1
-# type-check the scripts
-pnpm exec tsc --noEmit -p ../../marketing/promo-v0.7.0/record
+pulseaudio -n --daemonize=yes --exit-idle-time=-1 -L "module-null-sink sink_name=demo" -L module-native-protocol-unix
+pactl set-default-sink demo
+export PULSE_SERVER=$(pactl info | sed -n 's/^Server String: //p')
 ```
 
-`PROMO_PORT` (default 5311) is the preview server's port, so a run never collides with `test:e2e` on 5199.
-`PROMO_CRF` (default 16) and `PROMO_PRESET` (default `slow`) set the encode. Output goes to `../footage/`.
-A shot needs ffmpeg on the PATH. Frames are written to `.out/` while a shot runs and deleted when it ends (`.out/` is git-ignored).
+The model, through the metering proxy (every request is counted in `$OUT/claude-usage.jsonl`, cached input is priced at the
+full rate as an upper bound, and it refuses once the budget is spent):
 
-## What reuses what
+```bash
+BUDGET_USD=8 PORT=8788 OUT=/tmp/promo-run node apps/desktop/e2e-native/claude-proxy.mjs &
+```
 
-The scripts import `apps/desktop/e2e/fixtures.ts` (the `app` fixture: boots the app, records every IPC call, fails
-a shot on an uncaught exception, a CSP violation, an unanswered command or an unreleased deferred answer),
-`e2e/backend.ts` (the fake backend's answers, each taken from the Rust command's own body) and
-`e2e/audio-fixtures.ts`. Nothing is copied from them, so the shots stay in step with the app.
+## Recording
 
-| File | What it is |
-|---|---|
-| `lib/stage.ts` | The stage: frame-stepped capture, the pointer, typing, scrolling |
-| `lib/kit.ts` | The in-page half: stops the page's clock, animations and media, and steps them |
-| `lib/human.ts` | The pointer overlay (the capture is of the page, so it has no OS pointer) |
-| `lib/studio.ts` | `Studio` (the session the Rust store would hold) and `agentTurn` (the scripted assistant) |
-| `lib/music.ts` | The synthetic audio: drums, bass, pad, keys, lead, a formant "vocal", written from arithmetic |
-| `lib/media.ts` | Turns the page's play/pause log into a WAV that lines up with the footage |
-| `lib/history.ts`, `lib/orchestra.ts`, `lib/skills.ts` | A branching history, a 200-track session, the bundled skills |
-| `sN-*.shot.ts` | One shot each |
+From `apps/desktop/e2e-native` (the key is only ever in the environment of this one command; do not echo it):
 
-## How a frame is made, and why
+```bash
+APP=/path/to/usr/bin/edytlab-desktop OUT=/tmp/promo-run PROMO=1 RECORD=1 RECORD_AUDIO=demo.monitor \
+GDK_SCALE=2 SCREEN=3300x2200x24 ANTHROPIC_E2E_KEY=… DEMO_MODEL=claude-sonnet-5-5 DEMO_EFFORT=low \
+  ./run-suite.sh 9-promo-s1          # or s2 … s8b; several substrings run several stories
+```
 
-A capture at the device scale of 2 (3200x2000) takes 0.3 to 0.4 s on this machine, and `Page.startScreencast`
-cannot give a 2x image (Chromium caps its frames at the page's size in CSS pixels: a 1600x1000 page at scale 2
-delivers 1600x1000 frames). So the recording does not run in real time. After the app has booted the page's clock is
-stopped, and each frame is made by advancing it by exactly 1/30 s and taking a picture
-(`Page.captureScreenshot`, JPEG quality 95, 3200x2000). The page's JavaScript time (Playwright's fake clock), its CSS
-and Web animations (paused and seeked each frame) and its media playback position (computed from the page clock; the
-element still loads its file for real) all advance together, so the footage is 30 fps by construction, whatever else the
-machine is doing. Nothing in the app changes: its own code, styles and IPC calls run as built, and only the clocks it
-reads are the stepped ones. The encode is H.264 High, yuv420p, CRF 16, 30 fps, with no audio track.
+`GDK_SCALE=2` makes the page 1600x1000 CSS pixels at two screen pixels each; `SCREEN` is a display big enough for the
+window and its title bar. The story puts the window at the top left, sizes it so the page is exactly 1600x1000, finds where
+the page is on the screen (it moves the X pointer and asks the page where it landed) and films exactly that rectangle at
+3200x2000. Without `ANTHROPIC_E2E_KEY` the stories run against the scripted model (`fake-llm.mjs`, free), which is how
+each shot's screen work was rehearsed first; that is a rehearsal, not footage.
 
-A page that did not change between frames is not captured again: after a repeated frame the next ones take a cheap
-1x look first and a 2x picture only if the page differs.
+Each story is also a test: it asserts what its clip claims (the tools Claude ran, the gains, the node counts, the readout never
+going back, the mix file removed and written again), so a clip whose assertion fails is not used.
 
-## What is scripted
+Two things about the capture, both measured and handled:
 
-The assistant. There is no API key, so `agentTurn` raises the events the real agent loop raises
-(`agent://text-delta`, `tool-call`, `node-created`, `tool-call-end`, `done`, in the order `commands.rs` emits them) with
-the tool names and arguments of `docs/tools-reference.md`. Everything the user does is real: typing into the composer,
-key presses on a slider, clicks. See `../footage/README.md` for the shot-by-shot account and `../claims.md` for what each
-shot may be said to show.
+- **ffmpeg loses the first second or two** while it opens the display and the sound, so each story waits before it does
+  anything, and the clip is cut from the mark `start`.
+- **Sound and picture do not share a clock**, and how far apart they run changes from one recording to the next (0.07 to 1.0 s
+  across the runs made). A clip with sound therefore opens on a *beacon*: a white block over the top left of the page and a
+  1 kHz tone, sent in the same breath. `make-footage.mjs` finds the block's first frame and the tone's first sample, measures
+  the gap (it is in the clip's `.notes.json`, `sync.soundIsAheadBy`) and moves the sound by it. The beacon is before the clip's
+  start. The first Play's sound then starts within a frame or two of the app's Pause button appearing, as it should.
+
+## Cutting
+
+```bash
+OUT=/tmp/promo-run DEST=marketing/promo-v0.7.0/footage node marketing/promo-v0.7.0/record/make-footage.mjs [clip …]
+```
+
+It refuses a recording that ends before its story did (ffmpeg fell behind) or that dropped more than 15% of its frames, and
+says to record it again. `REENCODE=1` re-encodes a clip whose `.mp4` already exists.
+
+## If you re-take a clip
+
+The camera boxes and ring rectangles in `../remotion/src/shots.ts` are in CSS pixels of the page and the moments are in
+the clip's seconds; check them against the new clip (`remotion/scripts/stills.ts` renders stills of a cut).

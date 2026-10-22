@@ -1,18 +1,22 @@
 [
   {
-    "label": "request 1 sent",
-    "t": 4.27
+    "label": "start",
+    "t": 0
   },
   {
-    "label": "label set",
-    "t": 6.33
+    "label": "request 1",
+    "t": 1.5
   },
   {
-    "label": "request 2 sent",
-    "t": 12.6
+    "label": "named",
+    "t": 19.2
   },
   {
-    "label": "compaction done",
-    "t": 16.8
+    "label": "request 2",
+    "t": 22.73
+  },
+  {
+    "label": "asked",
+    "t": 45.2
   }
 ]

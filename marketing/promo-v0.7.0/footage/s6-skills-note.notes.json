@@ -1,19 +1,8 @@
 {
-  "file": "s6-skills-note.mp4",
-  "seconds": 11.167,
-  "frames": 335,
-  "captured": 119,
-  "marks": [
-    {
-      "label": "bundled note shown",
-      "t": 4
-    },
-    {
-      "label": "a skill opened",
-      "t": 8.97
-    }
-  ],
-  "spans": [],
+  "live": true,
+  "model": null,
+  "effort": null,
+  "note": "Skills that come with edytlab are updated when a release changes them, unless you have edited them.",
   "skills": [
     "dialog-enhancer",
     "export-guide",
@@ -24,5 +13,38 @@
     "silence-cleaner",
     "vocal-chain"
   ],
-  "opened": "loudness-master"
+  "assistant": "none in this shot",
+  "file": "s6-skills-note.mp4",
+  "seconds": 17.73,
+  "frames": 266,
+  "fps": 15,
+  "size": "3200x2000",
+  "marks": [
+    {
+      "label": "start",
+      "t": 0
+    },
+    {
+      "label": "skills tab",
+      "t": 5.33
+    },
+    {
+      "label": "bundled note shown",
+      "t": 7.27
+    },
+    {
+      "label": "a skill opened",
+      "t": 12.21
+    }
+  ],
+  "wav": null,
+  "spans": null,
+  "sync": null,
+  "capture": {
+    "frames": 279,
+    "dup": 0,
+    "drop": 23,
+    "speed": 1.01
+  },
+  "toolCalls": null
 }
