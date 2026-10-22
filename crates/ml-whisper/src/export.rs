@@ -1,0 +1,522 @@
+//! What the pinned ONNX export must look like, checked by name before any run.
+//!
+//! The decoder is fed by name (`past_key_values.3.decoder.key`) and read back
+//! by name (`present.3.decoder.key`, `cross_attentions.4`). A different
+//! export, such as another size, a quantised encoder with different outputs, or
+//! one without the `_timestamped` attention outputs, does not fail at
+//! those names with anything a person can act on: ONNX Runtime says
+//! "invalid input name" from deep inside a step, or, worse, a wrong size reads
+//! as a plausible transcript. So [`WhisperModel::load`](crate::WhisperModel::load)
+//! lists the inputs and outputs of both sessions and calls [`check`], which
+//! answers with one sentence about what differs.
+//!
+//! This is a pure function over names, element types and shapes, so CI tests
+//! it on made-up lists; `tests/transcribe_known_words.rs` runs it against the
+//! real files.
+//!
+//! ## The export, as the plan on #384 and `onnx-community/whisper-base_timestamped`
+//! (`608c49e61301901684bc36cac8f74b95ff6b5a8e`) have it
+//!
+//! | session | inputs | outputs |
+//! |---|---|---|
+//! | encoder | `input_features` f32 `[batch, 80, 3000]` | `last_hidden_state` f32 `[batch, 1500, 512]` |
+//! | merged decoder | `input_ids` i64 `[batch, seq]`, `encoder_hidden_states` f32 `[batch, 1500, 512]`, `past_key_values.{i}.{decoder,encoder}.{key,value}` f32 `[batch, 8, past, 64]` for 6 layers, `use_cache_branch` bool `[1]` | `logits` f32 `[batch, seq, 51865]`, `present.{i}.{decoder,encoder}.{key,value}`, `cross_attentions.{i}` f32 `[batch, 8, seq, 1500]` |
+
+use std::collections::BTreeSet;
+
+/// The element types the check cares about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Elem {
+    F32,
+    I64,
+    Bool,
+    Other,
+}
+
+/// One input or output of a session: its name, element type and shape (`-1`
+/// for a dimension that is not fixed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorSpec {
+    pub name: String,
+    pub elem: Elem,
+    pub dims: Vec<i64>,
+}
+
+impl TensorSpec {
+    pub fn new(name: &str, elem: Elem, dims: &[i64]) -> Self {
+        Self {
+            name: name.to_string(),
+            elem,
+            dims: dims.to_vec(),
+        }
+    }
+}
+
+/// The geometry of the decoder, read from its inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExportLayout {
+    /// Decoder layers (6 for `base`).
+    pub layers: usize,
+    /// Attention heads per layer (8).
+    pub heads: usize,
+    /// Width of one head (64).
+    pub head_dim: usize,
+    /// Width of the encoder's output and the decoder's model (512).
+    pub width: usize,
+    /// Frames the encoder emits for a 30 s window (1500).
+    pub frames: usize,
+    /// Width of the logits (51 865).
+    pub vocab: usize,
+}
+
+/// The `(layer, head)` pairs whose cross-attention lines tokens up with time,
+/// from `generation_config.json` of `whisper-base` (`alignment_heads`). The
+/// file is not one of the three the plan pins, so the list is here, as the
+/// suppress lists in `decode.rs` are.
+pub const BASE_ALIGNMENT_HEADS: [(usize, usize); 8] = [
+    (3, 1),
+    (4, 2),
+    (4, 3),
+    (4, 7),
+    (5, 1),
+    (5, 2),
+    (5, 4),
+    (5, 6),
+];
+
+/// The alignment heads of the export with this geometry, or `None` if this
+/// build does not know them (only `base`: 6 layers of 8 heads).
+pub fn alignment_heads(layers: usize, heads: usize) -> Option<&'static [(usize, usize)]> {
+    (layers == 6 && heads == 8).then_some(&BASE_ALIGNMENT_HEADS[..])
+}
+
+/// `past_key_values.{layer}.{decoder|encoder}.{key|value}`.
+pub fn past_name(layer: usize, encoder: bool, value: bool) -> String {
+    format!(
+        "past_key_values.{layer}.{}.{}",
+        if encoder { "encoder" } else { "decoder" },
+        if value { "value" } else { "key" }
+    )
+}
+
+/// `present.{layer}.{decoder|encoder}.{key|value}`.
+pub fn present_name(layer: usize, encoder: bool, value: bool) -> String {
+    format!(
+        "present.{layer}.{}.{}",
+        if encoder { "encoder" } else { "decoder" },
+        if value { "value" } else { "key" }
+    )
+}
+
+/// `cross_attentions.{layer}`.
+pub fn cross_name(layer: usize) -> String {
+    format!("cross_attentions.{layer}")
+}
+
+fn names(specs: &[TensorSpec]) -> BTreeSet<&str> {
+    specs.iter().map(|s| s.name.as_str()).collect()
+}
+
+fn list(items: impl IntoIterator<Item = impl AsRef<str>>) -> String {
+    let mut shown: Vec<String> = items
+        .into_iter()
+        .map(|s| format!("`{}`", s.as_ref()))
+        .collect();
+    let more = shown.len().saturating_sub(4);
+    shown.truncate(4);
+    let mut text = shown.join(", ");
+    if more > 0 {
+        text.push_str(&format!(" and {more} more"));
+    }
+    text
+}
+
+/// Check the encoder's lists against the export, naming what differs.
+pub fn check_encoder(inputs: &[TensorSpec], outputs: &[TensorSpec]) -> Result<(), String> {
+    let wrong = |what: String| Err(format!("encoder_model.onnx {what}"));
+    let [input] = inputs else {
+        return wrong(format!(
+            "takes {} inputs ({}), expected only `input_features`",
+            inputs.len(),
+            list(names(inputs))
+        ));
+    };
+    if input.name != "input_features" || input.elem != Elem::F32 || input.dims.len() != 3 {
+        return wrong(format!(
+            "input is `{}` ({:?}, rank {}), expected `input_features` as a rank 3 f32 tensor",
+            input.name,
+            input.elem,
+            input.dims.len()
+        ));
+    }
+    let Some(out) = outputs.iter().find(|o| o.name == "last_hidden_state") else {
+        return wrong(format!(
+            "has no output `last_hidden_state`; its outputs are {}",
+            list(names(outputs))
+        ));
+    };
+    if out.elem != Elem::F32 || out.dims.len() != 3 {
+        return wrong(format!(
+            "`last_hidden_state` is {:?} of rank {}, expected a rank 3 f32 tensor",
+            out.elem,
+            out.dims.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Check the decoder's lists against the export and read its geometry.
+///
+/// `encoder_output_dims` are the dims of the encoder's `last_hidden_state`;
+/// the decoder has to take what the encoder gives.
+pub fn check_decoder(
+    inputs: &[TensorSpec],
+    outputs: &[TensorSpec],
+    encoder_output_dims: &[i64],
+) -> Result<ExportLayout, String> {
+    let wrong = |what: String| Err(format!("decoder_model_merged_int8.onnx {what}"));
+    let input_names = names(inputs);
+    let output_names = names(outputs);
+
+    // The layers, from the decoder keys it takes.
+    let mut layers = 0usize;
+    while input_names.contains(past_name(layers, false, false).as_str()) {
+        layers += 1;
+    }
+    if layers == 0 {
+        return wrong(format!(
+            "has no input `past_key_values.0.decoder.key`, so it is not a merged decoder with a \
+             key-value cache; its inputs are {}",
+            list(&input_names)
+        ));
+    }
+
+    let mut expected_in: BTreeSet<String> =
+        ["input_ids", "encoder_hidden_states", "use_cache_branch"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+    let mut expected_out: BTreeSet<String> = BTreeSet::from(["logits".to_string()]);
+    for layer in 0..layers {
+        for encoder in [false, true] {
+            for value in [false, true] {
+                expected_in.insert(past_name(layer, encoder, value));
+                expected_out.insert(present_name(layer, encoder, value));
+            }
+        }
+        expected_out.insert(cross_name(layer));
+    }
+    let missing_in: Vec<_> = expected_in
+        .iter()
+        .filter(|n| !input_names.contains(n.as_str()))
+        .collect();
+    let extra_in: Vec<_> = input_names
+        .iter()
+        .filter(|n| !expected_in.contains(**n))
+        .collect();
+    if !missing_in.is_empty() || !extra_in.is_empty() {
+        return wrong(format!(
+            "has inputs that differ from the export: missing {}, unexpected {}",
+            if missing_in.is_empty() {
+                "none".to_string()
+            } else {
+                list(missing_in)
+            },
+            if extra_in.is_empty() {
+                "none".to_string()
+            } else {
+                list(extra_in)
+            }
+        ));
+    }
+    let missing_out: Vec<_> = expected_out
+        .iter()
+        .filter(|n| !output_names.contains(n.as_str()))
+        .collect();
+    if !missing_out.is_empty() {
+        let hint = if missing_out
+            .iter()
+            .any(|n| n.starts_with("cross_attentions"))
+        {
+            " (the `_timestamped` export has the cross-attention outputs word timing needs)"
+        } else {
+            ""
+        };
+        return wrong(format!("has no output {}{hint}", list(missing_out)));
+    }
+
+    let spec = |name: &str| {
+        inputs
+            .iter()
+            .find(|s| s.name == name)
+            .expect("checked above")
+    };
+    let out = |name: &str| {
+        outputs
+            .iter()
+            .find(|s| s.name == name)
+            .expect("checked above")
+    };
+
+    // Element types.
+    for (name, want) in [
+        ("input_ids", Elem::I64),
+        ("encoder_hidden_states", Elem::F32),
+        ("use_cache_branch", Elem::Bool),
+    ] {
+        if spec(name).elem != want {
+            return wrong(format!(
+                "takes `{name}` as {:?}, expected {want:?}",
+                spec(name).elem
+            ));
+        }
+    }
+    if out("logits").elem != Elem::F32 {
+        return wrong(format!(
+            "returns `logits` as {:?}, expected F32",
+            out("logits").elem
+        ));
+    }
+
+    // Geometry, from the first layer's decoder key `[batch, heads, past, head_dim]`.
+    let key = spec("past_key_values.0.decoder.key");
+    let (heads, head_dim) = match key.dims.as_slice() {
+        [_, h, _, d] if *h > 0 && *d > 0 => (*h as usize, *d as usize),
+        other => {
+            return wrong(format!(
+                "has `past_key_values.0.decoder.key` of shape {other:?}, expected \
+                 [batch, heads, past, head_dim] with fixed heads and head_dim"
+            ))
+        }
+    };
+    let width = match spec("encoder_hidden_states").dims.as_slice() {
+        [_, _, w] if *w > 0 => *w as usize,
+        other => {
+            return wrong(format!(
+                "has `encoder_hidden_states` of shape {other:?}, expected [batch, frames, width]"
+            ))
+        }
+    };
+    if width != heads * head_dim {
+        return wrong(format!(
+            "has {heads} heads of {head_dim} but a model width of {width}"
+        ));
+    }
+    let vocab = match out("logits").dims.as_slice() {
+        [_, _, v] if *v > 0 => *v as usize,
+        other => {
+            return wrong(format!(
+                "returns `logits` of shape {other:?}, expected [batch, seq, vocab]"
+            ))
+        }
+    };
+    let frames = match encoder_output_dims {
+        [_, f, w] if *f > 0 && *w as usize == width => *f as usize,
+        other => {
+            return Err(format!(
+                "encoder_model.onnx gives `last_hidden_state` of shape {other:?}, but the \
+                 decoder takes a width of {width} (expected [batch, frames, {width}] with fixed frames)"
+            ))
+        }
+    };
+    if alignment_heads(layers, heads).is_none() {
+        return wrong(format!(
+            "has {layers} layers of {heads} heads, and this build knows the alignment heads of \
+             whisper-base (6 layers of 8 heads) only"
+        ));
+    }
+    Ok(ExportLayout {
+        layers,
+        heads,
+        head_dim,
+        width,
+        frames,
+        vocab,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KV: [i64; 4] = [-1, 8, -1, 64];
+
+    /// The lists of the real `whisper-base_timestamped` export, as `ort`
+    /// printed them (see the PR for #384).
+    fn base_decoder() -> (Vec<TensorSpec>, Vec<TensorSpec>) {
+        let mut inputs = vec![
+            TensorSpec::new("input_ids", Elem::I64, &[-1, -1]),
+            TensorSpec::new("encoder_hidden_states", Elem::F32, &[-1, -1, 512]),
+        ];
+        let mut outputs = vec![TensorSpec::new("logits", Elem::F32, &[-1, -1, 51_865])];
+        for layer in 0..6 {
+            for encoder in [false, true] {
+                for value in [false, true] {
+                    inputs.push(TensorSpec::new(
+                        &past_name(layer, encoder, value),
+                        Elem::F32,
+                        &KV,
+                    ));
+                    outputs.push(TensorSpec::new(
+                        &present_name(layer, encoder, value),
+                        Elem::F32,
+                        &KV,
+                    ));
+                }
+            }
+            outputs.push(TensorSpec::new(
+                &cross_name(layer),
+                Elem::F32,
+                &[-1, 8, -1, -1],
+            ));
+        }
+        inputs.push(TensorSpec::new("use_cache_branch", Elem::Bool, &[1]));
+        (inputs, outputs)
+    }
+
+    fn base_encoder() -> (Vec<TensorSpec>, Vec<TensorSpec>) {
+        (
+            vec![TensorSpec::new("input_features", Elem::F32, &[-1, -1, -1])],
+            vec![TensorSpec::new(
+                "last_hidden_state",
+                Elem::F32,
+                &[-1, 1500, 512],
+            )],
+        )
+    }
+
+    #[test]
+    fn the_pinned_export_passes_and_gives_its_geometry() {
+        let (i, o) = base_encoder();
+        check_encoder(&i, &o).expect("encoder");
+        let (di, dos) = base_decoder();
+        let layout = check_decoder(&di, &dos, &[-1, 1500, 512]).expect("decoder");
+        assert_eq!(
+            layout,
+            ExportLayout {
+                layers: 6,
+                heads: 8,
+                head_dim: 64,
+                width: 512,
+                frames: 1500,
+                vocab: 51_865,
+            }
+        );
+    }
+
+    #[test]
+    fn a_decoder_without_use_cache_branch_names_it() {
+        let (mut di, dos) = base_decoder();
+        di.retain(|s| s.name != "use_cache_branch");
+        let err = check_decoder(&di, &dos, &[-1, 1500, 512]).unwrap_err();
+        assert!(err.contains("`use_cache_branch`"), "{err}");
+        assert!(err.contains("missing"), "{err}");
+        assert!(err.starts_with("decoder_model_merged_int8.onnx"), "{err}");
+    }
+
+    #[test]
+    fn a_decoder_with_an_input_it_does_not_feed_is_refused() {
+        let (mut di, dos) = base_decoder();
+        di.push(TensorSpec::new("position_ids", Elem::I64, &[-1, -1]));
+        let err = check_decoder(&di, &dos, &[-1, 1500, 512]).unwrap_err();
+        assert!(
+            err.contains("unexpected") && err.contains("`position_ids`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_export_without_the_attention_outputs_says_what_to_get() {
+        let (di, mut dos) = base_decoder();
+        dos.retain(|s| !s.name.starts_with("cross_attentions"));
+        let err = check_decoder(&di, &dos, &[-1, 1500, 512]).unwrap_err();
+        assert!(err.contains("cross_attentions.0"), "{err}");
+        assert!(err.contains("_timestamped"), "{err}");
+    }
+
+    #[test]
+    fn an_unmerged_decoder_is_not_mistaken_for_the_export() {
+        let inputs = vec![
+            TensorSpec::new("input_ids", Elem::I64, &[-1, -1]),
+            TensorSpec::new("encoder_hidden_states", Elem::F32, &[-1, -1, 512]),
+        ];
+        let outputs = vec![TensorSpec::new("logits", Elem::F32, &[-1, -1, 51_865])];
+        let err = check_decoder(&inputs, &outputs, &[-1, 1500, 512]).unwrap_err();
+        assert!(err.contains("merged decoder"), "{err}");
+    }
+
+    #[test]
+    fn another_size_is_refused_because_its_alignment_heads_are_unknown() {
+        // whisper-tiny: 4 layers of 6 heads of 64, width 384.
+        let mut inputs = vec![
+            TensorSpec::new("input_ids", Elem::I64, &[-1, -1]),
+            TensorSpec::new("encoder_hidden_states", Elem::F32, &[-1, -1, 384]),
+            TensorSpec::new("use_cache_branch", Elem::Bool, &[1]),
+        ];
+        let mut outputs = vec![TensorSpec::new("logits", Elem::F32, &[-1, -1, 51_865])];
+        for layer in 0..4 {
+            for encoder in [false, true] {
+                for value in [false, true] {
+                    inputs.push(TensorSpec::new(
+                        &past_name(layer, encoder, value),
+                        Elem::F32,
+                        &[-1, 6, -1, 64],
+                    ));
+                    outputs.push(TensorSpec::new(
+                        &present_name(layer, encoder, value),
+                        Elem::F32,
+                        &[-1, 6, -1, 64],
+                    ));
+                }
+            }
+            outputs.push(TensorSpec::new(
+                &cross_name(layer),
+                Elem::F32,
+                &[-1, 6, -1, -1],
+            ));
+        }
+        let err = check_decoder(&inputs, &outputs, &[-1, 1500, 384]).unwrap_err();
+        assert!(err.contains("4 layers of 6 heads"), "{err}");
+        assert!(err.contains("whisper-base"), "{err}");
+    }
+
+    #[test]
+    fn a_decoder_that_does_not_take_what_the_encoder_gives_is_refused() {
+        let (di, dos) = base_decoder();
+        let err = check_decoder(&di, &dos, &[-1, 1500, 768]).unwrap_err();
+        assert!(
+            err.contains("encoder_model.onnx") && err.contains("768"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_encoder_with_other_names_is_refused() {
+        let inputs = vec![TensorSpec::new("mel", Elem::F32, &[-1, 80, 3000])];
+        let (_, outputs) = base_encoder();
+        let err = check_encoder(&inputs, &outputs).unwrap_err();
+        assert!(err.contains("input_features"), "{err}");
+
+        let (inputs, _) = base_encoder();
+        let outputs = vec![TensorSpec::new("hidden", Elem::F32, &[-1, 1500, 512])];
+        let err = check_encoder(&inputs, &outputs).unwrap_err();
+        assert!(
+            err.contains("last_hidden_state") && err.contains("`hidden`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn names_follow_the_export() {
+        assert_eq!(past_name(3, false, false), "past_key_values.3.decoder.key");
+        assert_eq!(past_name(0, true, true), "past_key_values.0.encoder.value");
+        assert_eq!(present_name(5, true, false), "present.5.encoder.key");
+        assert_eq!(cross_name(4), "cross_attentions.4");
+    }
+
+    #[test]
+    fn only_base_has_known_alignment_heads() {
+        assert_eq!(alignment_heads(6, 8).map(<[_]>::len), Some(8));
+        assert!(alignment_heads(4, 6).is_none());
+    }
+}

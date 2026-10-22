@@ -8,7 +8,11 @@
 //!
 //! The model-dependent tests need a downloaded Whisper model, so they
 //! are `#[ignore]`d and run with `cargo test -p ml-whisper -- --ignored`
-//! once `WHISPER_MODEL_PATH` points at the `.onnx` file.
+//! once `WHISPER_MODEL_PATH` points at the model **folder** (the files of
+//! `onnx-community/whisper-base_timestamped`; it was a single `.onnx` file
+//! before `WhisperModel::load` read the whole export, #384). They exercise
+//! the stub the `transcribe` tool still calls. The real inference is tested
+//! in `transcribe_known_words.rs`, which reads `WHISPER_MODEL_DIR`.
 //!
 //! They used to gate on the env var at runtime and `return` early, which
 //! `cargo test` counts as **passed** — so a run that never entered the
@@ -38,9 +42,10 @@ const MODEL_PATH_VAR: &str = "WHISPER_MODEL_PATH";
 fn model_path() -> PathBuf {
     let var = std::env::var(MODEL_PATH_VAR).unwrap_or_else(|_| {
         panic!(
-            "{MODEL_PATH_VAR} is not set. Point it at an ONNX Whisper export to run the \
-             ignored ml-whisper tests. Note that the decoder itself is a stub (#233), so \
-             `transcribe` will return NotImplemented even with a valid model."
+            "{MODEL_PATH_VAR} is not set. Point it at the folder of an ONNX Whisper export \
+             to run the ignored ml-whisper tests. Note \
+             that the method the tool calls is a stub (#233), so `WhisperModel::transcribe` \
+             returns NotImplemented even with a valid model."
         )
     });
     let path = PathBuf::from(var);

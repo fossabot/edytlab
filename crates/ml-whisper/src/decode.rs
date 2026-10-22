@@ -120,6 +120,11 @@ pub enum DecodeError {
     /// The encoder output does not have the size it says.
     #[error("encoder states: {0}")]
     BadEncoderStates(String),
+
+    /// The caller asked to stop. The ONNX decoder checks between steps, so a
+    /// long window ends within one step of the request.
+    #[error("cancelled")]
+    Cancelled,
 }
 
 /// The ids of the special tokens the loop uses.
