@@ -1,7 +1,9 @@
 import type { MetadataRoute } from "next";
 
 import { modifiedOf, posts } from "@/lib/blog";
+import { escapeXml } from "@/lib/feed";
 import { absoluteUrl, pageUpdated, postPath } from "@/lib/seo";
+import { type WatchVideo, videoPath, videoPosterSrc, videoSrc, watchVideos } from "@/lib/videos";
 
 type Entry = MetadataRoute.Sitemap[number];
 
@@ -20,11 +22,34 @@ const pages: { path: string; priority: number; changeFrequency: Entry["changeFre
   { path: "/docs/api-reference", priority: 0.7, changeFrequency: "monthly" },
   { path: "/use-cases/dj", priority: 0.8, changeFrequency: "monthly" },
   { path: "/use-cases/local-ai-audio-editor", priority: 0.8, changeFrequency: "monthly" },
+  { path: "/videos", priority: 0.7, changeFrequency: "monthly" },
   { path: "/changelog", priority: 0.6, changeFrequency: "weekly" },
   { path: "/press", priority: 0.5, changeFrequency: "monthly" },
   { path: "/privacy", priority: 0.3, changeFrequency: "yearly" },
   { path: "/terms", priority: 0.3, changeFrequency: "yearly" },
 ];
+
+/**
+ * The `<video:video>` a watch page declares, for Google's video
+ * sitemap: its one video, from the same `lib/videos.ts` entry the page's
+ * `VideoObject` is made from, so the two cannot disagree. The fields
+ * are the ones Google requires (title, thumbnail, description) and the
+ * two it asks for (the file, and its length in seconds).
+ *
+ * Next writes these strings into the XML as they are, so the text is
+ * escaped here. Only the watch pages get one: the hub and the pages
+ * that also play the demos (the home page, the DJ page) are not where
+ * those videos are the main content.
+ */
+function videoSitemapEntry(video: WatchVideo) {
+  return {
+    title: escapeXml(video.title),
+    thumbnail_loc: absoluteUrl(videoPosterSrc(video.slug)),
+    description: escapeXml(video.description),
+    content_loc: absoluteUrl(videoSrc(video.slug)),
+    duration: video.seconds,
+  };
+}
 
 export default function sitemap(): MetadataRoute.Sitemap {
   // The newest post moves the blog index; every other page has a date of
@@ -46,5 +71,14 @@ export default function sitemap(): MetadataRoute.Sitemap {
     priority: 0.8,
   }));
 
-  return [...fixed, ...blogPosts];
+  // Each video has a page of its own, listed from the data like a post.
+  const videoPages: MetadataRoute.Sitemap = watchVideos.map((v) => ({
+    url: absoluteUrl(videoPath(v.slug)),
+    lastModified: new Date(pageUpdated(videoPath(v.slug))),
+    changeFrequency: "monthly",
+    priority: 0.6,
+    videos: [videoSitemapEntry(v)],
+  }));
+
+  return [...fixed, ...blogPosts, ...videoPages];
 }
