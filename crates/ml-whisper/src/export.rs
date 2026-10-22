@@ -69,6 +69,13 @@ pub struct ExportLayout {
     pub vocab: usize,
 }
 
+/// Mel bands the encoder takes.
+const MEL_BANDS: i64 = 80;
+/// Mel frames of a 30 s window.
+const MEL_FRAMES: i64 = 3_000;
+/// Frames the encoder emits for them: half as many.
+const ENCODER_FRAMES: i64 = 1_500;
+
 /// The `(layer, head)` pairs whose cross-attention lines tokens up with time,
 /// from `generation_config.json` of `whisper-base` (`alignment_heads`). The
 /// file is not one of the three the plan pins, so the list is here, as the
@@ -162,6 +169,22 @@ pub fn check_encoder(inputs: &[TensorSpec], outputs: &[TensorSpec]) -> Result<()
             out.dims.len()
         ));
     }
+    // The mel transform makes `[1, 80, 3000]` and the decoder and the timing
+    // work in the 1500 frames that come out. A dimension the export leaves
+    // dynamic (`-1`; the pinned encoder does for its input) cannot be checked
+    // here, but one it fixes has to be the pinned number.
+    let fixed = |dims: &[i64], at: usize, name: &str, want: i64| -> Result<(), String> {
+        match dims[at] {
+            d if d == want || d < 0 => Ok(()),
+            d => Err(format!(
+                "encoder_model.onnx has {name} of {d}, expected {want} (a 30 s window of the \
+                 pinned export)"
+            )),
+        }
+    };
+    fixed(&input.dims, 1, "`input_features` mel bands", MEL_BANDS)?;
+    fixed(&input.dims, 2, "`input_features` frames", MEL_FRAMES)?;
+    fixed(&out.dims, 1, "`last_hidden_state` frames", ENCODER_FRAMES)?;
     Ok(())
 }
 
@@ -311,11 +334,11 @@ pub fn check_decoder(
         }
     };
     let frames = match encoder_output_dims {
-        [_, f, w] if *f > 0 && *w as usize == width => *f as usize,
+        [_, f, w] if *f == ENCODER_FRAMES && *w as usize == width => *f as usize,
         other => {
             return Err(format!(
                 "encoder_model.onnx gives `last_hidden_state` of shape {other:?}, but the \
-                 decoder takes a width of {width} (expected [batch, frames, {width}] with fixed frames)"
+                 decoder takes a width of {width} (expected [batch, {ENCODER_FRAMES}, {width}])"
             ))
         }
     };
@@ -488,6 +511,34 @@ mod tests {
             err.contains("encoder_model.onnx") && err.contains("768"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn fixed_dimensions_that_are_not_the_pinned_ones_are_refused() {
+        // Dynamic ones (-1) pass, as the pinned encoder's input does.
+        let (_, out) = base_encoder();
+        let with_input = |dims: &[i64]| vec![TensorSpec::new("input_features", Elem::F32, dims)];
+        assert!(check_encoder(&with_input(&[1, 80, 3000]), &out).is_ok());
+        assert!(check_encoder(&with_input(&[-1, -1, -1]), &out).is_ok());
+        let err = check_encoder(&with_input(&[-1, 128, -1]), &out).unwrap_err();
+        assert!(err.contains("128") && err.contains("mel bands"), "{err}");
+        let err = check_encoder(&with_input(&[-1, 80, 1500]), &out).unwrap_err();
+        assert!(err.contains("1500") && err.contains("frames"), "{err}");
+
+        let (inp, _) = base_encoder();
+        let other = vec![TensorSpec::new(
+            "last_hidden_state",
+            Elem::F32,
+            &[-1, 750, 512],
+        )];
+        let err = check_encoder(&inp, &other).unwrap_err();
+        assert!(err.contains("750") && err.contains("1500"), "{err}");
+
+        // The decoder refuses an encoder whose frames are not 1500 too, or
+        // whose frames are not fixed.
+        let (di, dos) = base_decoder();
+        assert!(check_decoder(&di, &dos, &[-1, 750, 512]).is_err());
+        assert!(check_decoder(&di, &dos, &[-1, -1, 512]).is_err());
     }
 
     #[test]
