@@ -4172,9 +4172,13 @@ fn list_tracks_inner<R: Runtime>(
                             .volume_envelope
                             .iter()
                             .map(|p| EnvelopePointSummary {
-                                // Envelope times are clip-relative, so
-                                // they share the clip's domain.
-                                time_sec: p.time_samples as f64 / rate,
+                                // Envelope times are clip-relative, in the
+                                // clip's own frames (#677) — or, for one
+                                // stored before that, in project frames.
+                                time_sec: match c.volume_envelope_frames {
+                                    session::EnvelopeFrames::Source => p.time_samples as f64 / rate,
+                                    session::EnvelopeFrames::Project => p.time_samples as f64 / sr,
+                                },
                                 gain_db: p.gain_db,
                             })
                             .collect(),
@@ -8024,9 +8028,28 @@ mod tests {
     // -----------------------------------------------------------------
 
     /// A track with one clip, so `set_clip_envelope` has something to
-    /// write to. The clip points at no real file — nothing here decodes
-    /// audio, and the envelope is clip metadata.
+    /// write to. The clip is a one-second 48 kHz WAV: nothing here decodes
+    /// its audio, but the envelope is counted in the clip's own frames
+    /// (#677), so the tool reads its header for the rate.
     fn state_with_one_clip(tmp: &std::path::Path) -> AppState {
+        let frames: u32 = 48_000;
+        let data_len = frames * 2;
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+        wav.extend_from_slice(&48_000u32.to_le_bytes());
+        wav.extend_from_slice(&96_000u32.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        wav.resize(wav.len() + data_len as usize, 0);
+        std::fs::write(tmp.join("clip.wav"), wav).unwrap();
+
         let state = state_with_tracks(tmp, 1);
         let handle = state.store_handle().unwrap();
         let mut store = handle.lock().unwrap();
@@ -8042,6 +8065,7 @@ mod tests {
             pitch_shift_semitones: None,
             beat_grid: None,
             volume_envelope: Vec::new(),
+            volume_envelope_frames: Default::default(),
         });
         store
             .append(session::SessionNode {
@@ -8062,8 +8086,8 @@ mod tests {
         head_tracks(state)[0].clips[0].volume_envelope.clone()
     }
 
-    /// Points go in as seconds and come back as samples on the session's
-    /// own rate — the conversion the tool does. The fixture is 48 kHz.
+    /// Points go in as seconds and come back as samples on the clip's
+    /// own rate (#677) — the conversion the tool does. The fixture is 48 kHz.
     #[test]
     fn setting_an_envelope_appends_one_node_and_round_trips() {
         let tmp = tempdir().unwrap();
