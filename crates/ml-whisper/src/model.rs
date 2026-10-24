@@ -102,11 +102,18 @@ fn registry() -> &'static ModelRegistry {
     REGISTRY.get_or_init(ModelRegistry::new)
 }
 
-/// A registry id that changes when the file does, and that names the role:
-/// the same file given to both roles (a wrong folder, or symlinks) is two
-/// sessions, not one session locked twice.
-fn session_id(role: &str, path: &Path) -> String {
+/// Where a session comes from: the role and the file's place. It names the
+/// role, so the same file given to both roles (a wrong folder, or symlinks) is
+/// two sessions, not one session locked twice.
+fn session_family(role: &str, path: &Path) -> String {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    format!("whisper:{role}:{}", canonical.display())
+}
+
+/// What the file holds, as far as the registry can tell without reading it: its
+/// size and modification time. A file that is replaced is a new version of the
+/// same [`session_family`], which gets a new session.
+fn file_version(path: &Path) -> String {
     let (len, modified) = std::fs::metadata(path)
         .map(|m| {
             let nanos = m
@@ -117,7 +124,24 @@ fn session_id(role: &str, path: &Path) -> String {
             (m.len(), nanos)
         })
         .unwrap_or((0, 0));
-    format!("whisper:{role}:{}:{len}:{modified}", canonical.display())
+    format!("{len}:{modified}")
+}
+
+/// The session for one of the model's files. The registry drops the sessions of
+/// the file's earlier versions once this one is built (#658), so replacing the
+/// model's files does not leave the old weights loaded for the rest of the
+/// process.
+fn load_session(
+    registry: &ModelRegistry,
+    role: &str,
+    path: &Path,
+) -> std::result::Result<SharedSession, ml_pipeline::Error> {
+    registry.load_versioned(
+        &session_family(role, path),
+        &file_version(path),
+        path,
+        ExecProvider::Cpu,
+    )
 }
 
 /// Turn the pipeline's error for loading `file` into ours.
@@ -167,19 +191,9 @@ impl WhisperModel {
         let tokenizer = Tokenizer::from_file(&files.tokenizer)?;
         let ids = token_ids(&tokenizer)?;
 
-        let encoder = registry()
-            .load(
-                &session_id("encoder", &files.encoder),
-                &files.encoder,
-                ExecProvider::Cpu,
-            )
+        let encoder = load_session(registry(), "encoder", &files.encoder)
             .map_err(|e| load_error(e, &files.encoder))?;
-        let decoder = registry()
-            .load(
-                &session_id("decoder", &files.decoder),
-                &files.decoder,
-                ExecProvider::Cpu,
-            )
+        let decoder = load_session(registry(), "decoder", &files.decoder)
             .map_err(|e| load_error(e, &files.decoder))?;
 
         // One lock at a time.
@@ -604,6 +618,82 @@ mod tests {
         }
     }
 
+    // ---- replacing the files of a loaded model, on the real model -----------------
+
+    /// Copy the three files of a model folder into `to`, as the downloader lays them out.
+    fn copy_model(from: &Path, to: &Path) {
+        for file in [ENCODER_FILE, DECODER_FILE, TOKENIZER_FILE] {
+            let target = to.join(file);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::copy(from.join(file), &target).unwrap();
+        }
+    }
+
+    /// Give the model files in `dir` a later modification time, which is what
+    /// a model removed and downloaded again looks like to `file_version`.
+    fn touch_model(dir: &Path, later_by: std::time::Duration) {
+        for file in [ENCODER_FILE, DECODER_FILE] {
+            let f = std::fs::File::options()
+                .write(true)
+                .open(dir.join(file))
+                .unwrap();
+            f.set_modified(std::time::SystemTime::now() + later_by)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "needs ORT_DYLIB_PATH and WHISPER_MODEL_PATH (the folder of the pinned whisper-base)"]
+    fn replacing_the_model_files_replaces_their_sessions() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let source =
+            PathBuf::from(std::env::var_os("WHISPER_MODEL_PATH").expect(
+                "WHISPER_MODEL_PATH is not set: a skipped --ignored test is a vacuous pass",
+            ));
+        assert!(
+            std::env::var_os("ORT_DYLIB_PATH").is_some(),
+            "ORT_DYLIB_PATH is not set: a skipped --ignored test is a vacuous pass"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        copy_model(&source, dir.path());
+
+        // The registry is the process's, so count against where it started.
+        let start = registry().len();
+
+        let first = WhisperModel::load(dir.path()).expect("the model loads");
+        assert_eq!(registry().len(), start + 2, "an encoder and a decoder");
+        let first_encoder = Arc::downgrade(&first.encoder);
+        let first_decoder = Arc::downgrade(&first.decoder);
+        drop(first);
+        assert!(
+            first_encoder.upgrade().is_some(),
+            "the registry keeps the sessions of a model that is not in use, so the next load is quick"
+        );
+
+        // The files are replaced (the model removed and downloaded again).
+        touch_model(dir.path(), Duration::from_secs(3600));
+        let second = WhisperModel::load(dir.path()).expect("the replaced model loads");
+        assert_eq!(
+            registry().len(),
+            start + 2,
+            "the sessions of the files that were replaced are still held: about 136 MB each time"
+        );
+        assert!(
+            first_encoder.upgrade().is_none() && first_decoder.upgrade().is_none(),
+            "nothing uses the first sessions and the registry still holds them"
+        );
+
+        // A model that is in use when its files are replaced keeps working.
+        touch_model(dir.path(), Duration::from_secs(7200));
+        let third = WhisperModel::load(dir.path()).expect("loads again");
+        assert_eq!(registry().len(), start + 2);
+        assert!(!lock_session(&second.encoder).inputs().is_empty());
+        assert!(!lock_session(&second.decoder).inputs().is_empty());
+        drop((second, third));
+    }
+
     // ---- the cost of a step, on the real model ----------------------------------
 
     /// What a forced decode of `steps` tokens moved out of the runtime, and how
@@ -728,12 +818,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("m.onnx");
         std::fs::write(&file, b"x").unwrap();
-        assert_ne!(session_id("encoder", &file), session_id("decoder", &file));
-        assert_eq!(session_id("encoder", &file), session_id("encoder", &file));
-        // And a changed file is a new session.
-        let before = session_id("encoder", &file);
+        assert_ne!(
+            session_family("encoder", &file),
+            session_family("decoder", &file)
+        );
+        assert_eq!(
+            session_family("encoder", &file),
+            session_family("encoder", &file)
+        );
+        // And a changed file is a new version of the same place, which is a
+        // new session (and the registry drops the old one: #658).
+        let before = (session_family("encoder", &file), file_version(&file));
         std::fs::write(&file, b"xy").unwrap();
-        assert_ne!(before, session_id("encoder", &file));
+        assert_eq!(before.0, session_family("encoder", &file));
+        assert_ne!(before.1, file_version(&file));
     }
 
     #[test]
