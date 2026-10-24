@@ -56,6 +56,13 @@
 //! - any other refusal (`invalid_client` and the like) also keeps the
 //!   credentials and waits, and is reported as it is.
 //!
+//! A refreshed ID token is checked against the original, and only a validly
+//! signed one for **another account** ends the session (and is revoked). One
+//! that does not verify for any other reason is dropped with a log line and the
+//! session keeps its tokens, since the preview's claims are still moving.
+//! A refresh response is read leniently: a malformed optional field (`expires_in`
+//! as text, `earliest_refresh_at` as a date) never loses the rotated token.
+//!
 //! **Sign-out** ([`ChatGptSession::sign_out`]) signs the account out of
 //! every window. Under the lock it reads the stored refresh token whatever
 //! this window's state, clears it, marks the account signed out (keeping the
@@ -952,6 +959,17 @@ impl Core {
                     if now < t.expires_at && !same_secret(&t.token, rejected) {
                         return Ok(t.token.clone());
                     }
+                    // The API refused the token we hold, before the issuer
+                    // lets it be renewed. An early refresh is refused
+                    // upstream (devkit#5) and would only spend the refresh
+                    // token, so nothing is sent: the caller is told to try
+                    // again, and the token stays as it is.
+                    if now < t.expires_at && t.earliest_refresh_at.is_some_and(|at| now < at) {
+                        return Err(BearerError::Unavailable {
+                            reason: "OpenAI refused the access token before it can be renewed"
+                                .to_string(),
+                        });
+                    }
                 }
                 if let Some(r) = a.retry.as_ref().filter(|r| now < r.not_before) {
                     return Err(r.error.clone());
@@ -1213,20 +1231,38 @@ impl Core {
                 .await;
             match checked {
                 Ok(_) => {}
-                Err(e) if oidc_error_is_transient(&e) => {
-                    return Err(self.failed(BearerError::Unavailable {
-                        reason: e.to_string(),
-                    }));
-                }
-                Err(e) => {
+                // The ID token is a validly signed one for another account:
+                // that is an identity problem, whatever the preview is doing.
+                Err(OidcError::SubjectChanged) => {
                     let reason = EndReason::IdTokenRejected {
-                        reason: e.to_string(),
+                        reason: OidcError::SubjectChanged.to_string(),
                     };
                     tracing::warn!("chatgpt: session ended: {reason}");
                     // Refused, so not left live at OpenAI either.
                     self.revoke_quietly(client_id, &refresh_token).await;
                     self.end(reason.clone(), Some(&refresh_token)).await;
                     return Err(BearerError::SessionEnded(reason));
+                }
+                // Any other fault in the refreshed ID token, a transient one
+                // (the JWKS cannot be fetched, a key the cache does not hold
+                // yet) as much as a claim the
+                // preview now words differently, an `aud` or `azp` that
+                // changed, a missing `auth_time`) does not make the grant
+                // any less the user's: the refresh token and the access
+                // token came from the issuer's token endpoint over TLS, for
+                // the client and account the sign-in verified with every
+                // check. Ending the session and revoking it for that would
+                // be destructive and unrecoverable but by a new sign-in,
+                // while the preview is moving. So the session keeps the
+                // tokens, drops the ID token, and says so in the log (the
+                // reason, never the token or its claims). Identity stays
+                // what the sign-in verified; nothing about this account
+                // changes until the next sign-in checks it again.
+                Err(e) => {
+                    tracing::warn!(
+                        "chatgpt: a refreshed ID token was not verified and was ignored; the \
+                         session keeps its tokens: {e}"
+                    );
                 }
             }
         }

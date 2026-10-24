@@ -160,6 +160,16 @@ pub struct Knobs {
     /// `earliest_refresh_at`, this many seconds after issue.
     pub earliest_refresh_after: Option<u64>,
     pub expires_in: u64,
+    /// `expires_in` as the server writes it, whatever the type: replaces the
+    /// number when set.
+    pub expires_in_raw: Option<Value>,
+    /// `earliest_refresh_at` as the server writes it, whatever the type.
+    pub earliest_refresh_raw: Option<Value>,
+    /// `token_type` as the server writes it: `None` leaves it `Bearer`,
+    /// `Some(None)` leaves the field out, `Some(Some(v))` writes `v`.
+    pub token_type_raw: Option<Option<Value>>,
+    /// The JWKS answers this status instead of the keys.
+    pub jwks_status: Option<u16>,
     /// Every refresh answers this.
     pub refresh_error: Option<(u16, Value)>,
     /// Every code exchange answers this.
@@ -188,6 +198,10 @@ impl Default for Knobs {
             refresh_kid: None,
             earliest_refresh_after: None,
             expires_in: 3600,
+            expires_in_raw: None,
+            earliest_refresh_raw: None,
+            token_type_raw: None,
+            jwks_status: None,
             refresh_error: None,
             exchange_error: None,
             revoke_statuses: Vec::new(),
@@ -256,9 +270,7 @@ impl Fake {
             .await;
         Mock::given(method("GET"))
             .and(path("/.well-known/jwks.json"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({ "keys": [key().jwk("k1")] })),
-            )
+            .respond_with(Responder(fake.clone(), Endpoint::Jwks))
             .mount(&fake.server)
             .await;
         Mock::given(method("POST"))
@@ -389,6 +401,19 @@ impl Fake {
         if let Some(after) = knobs.earliest_refresh_after {
             body["earliest_refresh_at"] = (self.clock.unix() + after).into();
         }
+        if let Some(raw) = &knobs.expires_in_raw {
+            body["expires_in"] = raw.clone();
+        }
+        match &knobs.token_type_raw {
+            Some(None) => {
+                body.as_object_mut().unwrap().remove("token_type");
+            }
+            Some(Some(raw)) => body["token_type"] = raw.clone(),
+            None => {}
+        }
+        if let Some(raw) = &knobs.earliest_refresh_raw {
+            body["earliest_refresh_at"] = raw.clone();
+        }
         if let Some(id_token) = id_token {
             body["id_token"] = id_token.into();
         }
@@ -504,6 +529,7 @@ impl Fake {
 }
 
 enum Endpoint {
+    Jwks,
     Discovery,
     Token,
     Revoke,
@@ -514,6 +540,12 @@ struct Responder(Arc<Fake>, Endpoint);
 impl Respond for Responder {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         match self.1 {
+            Endpoint::Jwks => match self.0.knobs().jwks_status {
+                Some(status) => ResponseTemplate::new(status),
+                None => {
+                    ResponseTemplate::new(200).set_body_json(json!({ "keys": [key().jwk("k1")] }))
+                }
+            },
             Endpoint::Discovery => self.0.discovery(),
             Endpoint::Token => self.0.token_endpoint(request),
             Endpoint::Revoke => self.0.revoke_endpoint(request),

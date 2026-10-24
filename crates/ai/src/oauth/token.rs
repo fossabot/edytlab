@@ -34,6 +34,9 @@ use super::{
 /// A token endpoint's reply is read up to this size.
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
+/// The shortest `expires_in` believed, in seconds. See [`capped_expires_in`].
+pub const MIN_EXPIRES_IN: u64 = 60;
+
 /// The longest `expires_in` kept, in seconds: one day. Access tokens live
 /// for minutes or hours; a larger value is read as this, so a caller's
 /// `Instant::now() + Duration::from_secs(expires_in)` cannot overflow (with
@@ -151,28 +154,65 @@ impl From<RawOAuthErrorBody> for OAuthErrorBody {
 #[derive(Clone, Deserialize)]
 pub struct TokenResponse {
     pub access_token: SecretString,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub refresh_token: Option<SecretString>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub id_token: Option<SecretString>,
     /// `Bearer`, in some case: a response with any other type, or none, is
     /// refused (RFC 6749 §5.1 requires it, and RFC 6750 bearer use is all
     /// this client does with a token).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub token_type: String,
-    /// Seconds from now, at most [`MAX_EXPIRES_IN`]: a larger value is read
-    /// as that.
+    /// Seconds from now, at least [`MIN_EXPIRES_IN`] (a smaller one is read
+    /// as absent) and at most [`MAX_EXPIRES_IN`]: a larger value is read as
+    /// that.
     #[serde(default, deserialize_with = "capped_expires_in")]
     pub expires_in: Option<u64>,
     /// The granted scopes, space-separated.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub scope: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
 
+/// `expires_in` as an integer, a float, a numeric string or null; anything
+/// else is "not given". A success response is parsed **leniently**: the
+/// server has already rotated the refresh token by the time it answers, so a
+/// malformed optional field that failed the whole response would lose a token
+/// that cannot be had again (the next attempt spends the old one and the
+/// session ends). A field that is wrong is read as absent, and the caller
+/// falls back to the documented default.
 fn capped_expires_in<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
-    Ok(Option::<u64>::deserialize(d)?.map(|secs| secs.min(MAX_EXPIRES_IN)))
+    let value = Value::deserialize(d)?;
+    // Under a minute is a server saying nothing useful, not a token that
+    // lives that long: "0", `0` and `0.4` would have the caller refresh on
+    // every request. Absent, the caller uses the documented lifetime.
+    Ok(seconds_of(&value)
+        .filter(|secs| *secs >= MIN_EXPIRES_IN)
+        .map(|secs| secs.min(MAX_EXPIRES_IN)))
+}
+
+/// A non-negative number of seconds in a JSON value: an integer, a float
+/// (truncated), or a string holding either. Not a negative, not `NaN`, not
+/// infinite.
+pub fn seconds_of(value: &Value) -> Option<u64> {
+    let secs = match value {
+        Value::Number(n) => n.as_f64()?,
+        Value::String(s) => s.trim().parse::<f64>().ok()?,
+        _ => return None,
+    };
+    (secs.is_finite() && secs >= 0.0).then_some(secs.min(u64::MAX as f64) as u64)
+}
+
+/// The field if it parses as `T`, else `T::default()`: a field of the wrong
+/// type is read as absent. See [`capped_expires_in`] for why.
+fn lenient<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned + Default,
+{
+    let value = Value::deserialize(d)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
 impl TokenResponse {
@@ -276,7 +316,7 @@ impl TokenClient {
             ("redirect_uri", redirect_uri),
         ];
         form.extend_from_slice(extra);
-        self.token_request(&form).await
+        self.token_request(&form, true).await
     }
 
     /// Uses a refresh token. No `scope` is sent, so the grant is kept as it
@@ -294,7 +334,9 @@ impl TokenClient {
             ("refresh_token", refresh_token.expose_secret()),
         ];
         form.extend_from_slice(extra);
-        self.token_request(&form).await
+        // The server has rotated the refresh token by the time it answers:
+        // see `validate` for why a missing `token_type` does not fail this.
+        self.token_request(&form, false).await
     }
 
     /// Revokes `token` at `revocation_endpoint` (RFC 7009 §2.1). Any 2xx is
@@ -319,7 +361,11 @@ impl TokenClient {
         }
     }
 
-    async fn token_request(&self, form: &[(&str, &str)]) -> Result<TokenResponse, TokenError> {
+    async fn token_request(
+        &self,
+        form: &[(&str, &str)],
+        require_token_type: bool,
+    ) -> Result<TokenResponse, TokenError> {
         let (status, body) = self.post(&self.token_endpoint, form).await?;
         if !(200..300).contains(&status) {
             return Err(failure(status, &body));
@@ -334,18 +380,7 @@ impl TokenClient {
                 e.column()
             ))
         })?;
-        if response.access_token.is_empty() {
-            return Err(TokenError::InvalidResponse(
-                "the access token is empty".into(),
-            ));
-        }
-        if !response.token_type.eq_ignore_ascii_case("bearer") {
-            return Err(TokenError::InvalidResponse(format!(
-                "the token type is {:?}, not Bearer",
-                printable(&response.token_type, 32)
-            )));
-        }
-        Ok(response)
+        validate(response, require_token_type)
     }
 
     async fn post(&self, url: &Url, form: &[(&str, &str)]) -> Result<(u16, Vec<u8>), TokenError> {
@@ -368,11 +403,119 @@ impl TokenClient {
     }
 }
 
+/// The checks a parsed success response must pass.
+///
+/// `require_token_type` is whether the `token_type` field must be there:
+/// RFC 6749 §5.1 requires it, so a code exchange does. A refresh response is
+/// the case where it is not worth failing for: the server has already rotated
+/// the refresh token by the time it answers, so refusing the response loses a
+/// token that cannot be had again, and a missing or unreadable type can only
+/// mean the one kind this client uses. A type that is there and is not Bearer
+/// is refused either way.
+fn validate(
+    response: TokenResponse,
+    require_token_type: bool,
+) -> Result<TokenResponse, TokenError> {
+    if response.access_token.is_empty() {
+        return Err(TokenError::InvalidResponse(
+            "the access token is empty".into(),
+        ));
+    }
+    let typeless = response.token_type.is_empty() && !require_token_type;
+    if !typeless && !response.token_type.eq_ignore_ascii_case("bearer") {
+        return Err(TokenError::InvalidResponse(format!(
+            "the token type is {:?}, not Bearer",
+            printable(&response.token_type, 32)
+        )));
+    }
+    Ok(response)
+}
+
 /// A non-2xx reply: its RFC 6749 §5.2 body (in either shape
 /// [`OAuthErrorBody`] reads) if it has one, else its status.
 fn failure(status: u16, body: &[u8]) -> TokenError {
     match serde_json::from_slice::<OAuthErrorBody>(body) {
         Ok(body) if !body.error.is_empty() => TokenError::OAuth { status, body },
         _ => TokenError::Status { status },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn parse(extra: Value) -> TokenResponse {
+        let mut body =
+            json!({ "access_token": "a", "token_type": "Bearer", "refresh_token": "rt" });
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        serde_json::from_value(body).expect("a success response always parses")
+    }
+
+    /// `expires_in` as the integer, float, numeric string, null, or something
+    /// else a server writes. None of it fails the response, which would lose
+    /// the rotated refresh token that came with it.
+    #[test]
+    fn expires_in_is_read_leniently_and_never_fails_the_response() {
+        for (given, wanted) in [
+            (json!(3600), Some(3600)),
+            (json!(3600.9), Some(3600)),
+            (json!("3600"), Some(3600)),
+            (json!(" 1800.0 "), Some(1800)),
+            (json!(1e12), Some(MAX_EXPIRES_IN)),
+            // Under a minute is not a lifetime: it would refresh on every
+            // request.
+            (json!(0), None),
+            (json!("0"), None),
+            (json!(0.4), None),
+            (json!(59), None),
+            (json!(60), Some(60)),
+            (json!(null), None),
+            (json!("an hour"), None),
+            (json!(-1), None),
+            (json!("-1"), None),
+            (json!({ "secs": 1 }), None),
+            (json!([3600]), None),
+            (json!(true), None),
+        ] {
+            let response = parse(json!({ "expires_in": given }));
+            assert_eq!(response.expires_in, wanted, "{given}");
+            assert_eq!(
+                response.refresh_token.as_ref().map(|t| t.expose_secret()),
+                Some("rt"),
+                "{given}: the rotated token is still there"
+            );
+        }
+        assert_eq!(parse(json!({})).expires_in, None, "absent");
+    }
+
+    /// Fields of the wrong type are absent, not an error, and the response
+    /// then goes through the same checks a received one does: a refresh
+    /// accepts one with no usable `token_type` (the rotated refresh token
+    /// must not be lost), a code exchange does not.
+    #[test]
+    fn the_other_optional_fields_are_lenient_too() {
+        let response = parse(json!({ "scope": 5, "id_token": ["x"], "token_type": null }));
+        assert_eq!(response.scope, None);
+        assert!(response.id_token.is_none());
+        assert_eq!(response.token_type, "");
+        assert_eq!(response.access_token.expose_secret(), "a");
+
+        let kept = validate(response.clone(), false).expect("a refresh keeps it");
+        assert_eq!(
+            kept.refresh_token.as_ref().map(|t| t.expose_secret()),
+            Some("rt"),
+            "the rotated refresh token is still there"
+        );
+        assert!(
+            validate(response, true).is_err(),
+            "a code exchange needs the type"
+        );
+        // A type that is there and is not Bearer is refused by both.
+        let mac = parse(json!({ "token_type": "mac" }));
+        assert!(validate(mac.clone(), false).is_err());
+        assert!(validate(mac, true).is_err());
     }
 }
