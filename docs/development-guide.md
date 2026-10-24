@@ -147,10 +147,10 @@ lists them as ignored, and asking for them with `--ignored` makes them
 ```bash
 # ONNX Runtime 1.23.2, checked against apps/desktop/src-tauri/ml-runtime.json
 export ORT_DYLIB_PATH="$(scripts/fetch-ml-runtime.sh linux-x64 /tmp/ml/ort)"
-# the folder of the three whisper-base files (about 139 MB): download the
-# urls in crates/ml-pipeline/models.json, check each size and SHA-256 there,
-# and keep the paths as they are written (onnx/encoder_model.onnx, ...)
-export WHISPER_MODEL_PATH=/tmp/ml/whisper-base
+# the folder of the three whisper-base files (about 139 MB), each checked
+# against the size and SHA-256 in crates/ml-pipeline/models.json; run again,
+# it downloads nothing, and a file that has been damaged is downloaded again
+export WHISPER_MODEL_PATH="$(scripts/fetch-ml-model.sh whisper-base /tmp/ml/whisper-base)"
 
 # the words, their start times and the realtime factor (--release is much faster)
 cargo test -p ml-whisper --release --test transcribe_known_words -- --ignored --nocapture --test-threads=1
@@ -160,7 +160,16 @@ cargo test -p ml-whisper --release --test transcribe_known_words -- --ignored --
 cargo test -p tools --release --test transcribe_end_to_end -- --ignored --nocapture
 # the tool's answers for a model that is not there or will not load
 cargo test -p tools --test transcribe_load_errors -- --ignored
+# the two ignored tests in ml-whisper's smoke file, which load the model
+cargo test -p ml-whisper --release --test transcribe_smoke -- --ignored --nocapture --test-threads=1
+# the downloader against huggingface.co (writes to a temporary folder of its own)
+cargo test -p ml-pipeline --release --test model_real_download -- --ignored --nocapture --test-threads=1
 ```
+
+`scripts/fetch-ml-model.sh` is for this and for CI: the app never runs it,
+and nothing it ships downloads a model except the user's click on Download.
+To run all of it on GitHub instead, dispatch the **ML** workflow
+([Workflow: `ml.yml`](#workflow-mlyml-ml)).
 
 The test audio, `crates/ml-whisper/tests/fixtures/speech_words.wav`, is
 `espeak-ng` output (`make_speech.py` regenerates it, with the exact word
@@ -673,6 +682,43 @@ The other manifests mirror it, and `apps/desktop/src/__tests__/appVersion.test.t
 `cargo audit` scans `Cargo.lock` against the RustSec advisory database: weekly (Monday 06:23 UTC), on `workflow_dispatch`, and on PRs that change `Cargo.lock` or a `Cargo.toml`. A vulnerability fails it; an unmaintained, unsound or yanked crate only warns. There is no `ignore` list: clear a red run by bumping the crate (`cargo update -p <crate> --precise <version>`). The `cargo-audit` version is pinned in the workflow's `CARGO_AUDIT_VERSION`.
 
 It is a workflow of its own, not a `ci.yml` job, and it does not run on push: `auto-release.yml` waits only on the run named "CI", so an advisory published on a quiet day can never turn that run red and skip a dev release. Do not make it a required check, since a PR its path filter skips would wait on it forever.
+
+### Workflow: `ml.yml` (ML)
+
+The tests that need the real speech model and the real ONNX Runtime, on
+Linux, with `--ignored`, against the pins in
+`apps/desktop/src-tauri/ml-runtime.json` and `crates/ml-pipeline/models.json`
+(about 22 MB of runtime and 139 MB of model, both from third parties):
+
+- `ml-whisper`: `transcribe_known_words`, and the two ignored tests of `transcribe_smoke`;
+- `tools`: `transcribe_end_to_end` (the `transcribe` tool on the real model,
+  through a session, #668) and `transcribe_load_errors` (needs only the runtime);
+- `ml-pipeline`: `model_real_download` (the downloader against huggingface.co).
+
+**Trigger:** `workflow_dispatch` only. It does not run on push, on a pull
+request or on a schedule, so a run is always someone's choice. Dispatch it
+from the Actions tab (ML, Run workflow, pick the branch) or with
+`gh workflow run ml.yml --ref <branch>`, then `gh run watch`. (GitHub lists a
+workflow for dispatch only once its file is on the default branch, so a change
+to `ml.yml` itself can be tried on a branch only after a version of the file
+has merged; to try the test steps on a branch before that, run the commands
+in [Running the model tests locally](#running-the-model-tests-locally).)
+
+**Caches:** the runtime and the model are cached under keys made from their
+manifests (`hashFiles` of `ml-runtime.json` and of `models.json`), so changing
+a pin misses. The two fetch steps run on a hit as well and check what was
+restored against the manifest: a file whose size or SHA-256 is not the pinned
+one is deleted and downloaded again, and that download is checked in turn. A
+damaged cache therefore costs a download and does not fail the run; a download
+that is not the pin fails the step, with nothing left under the file's name.
+`crates/tools/tests/ml_workflow.rs` runs the model script against a damaged
+folder to hold that.
+
+It is a workflow of its own, not a `ci.yml` job, for the reason `audit.yml` is:
+`auto-release.yml` waits on the run named "CI", and a failure here (a pin that
+upstream removed) must not skip a release. Do not make it a required check.
+`ml_workflow.rs` also keeps it dispatch-only, pins its actions to release tags
+and checks that the tests it names exist and are ignored. No secrets are needed.
 
 ### Workflow: `auto-release.yml`
 
