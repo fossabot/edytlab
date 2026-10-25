@@ -566,7 +566,6 @@ impl LlmProvider for AnthropicProvider {
     fn apply_auth(&self, req: reqwest::RequestBuilder, api_key: &str) -> reqwest::RequestBuilder {
         req.header("x-api-key", api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
     }
 }
 
@@ -601,7 +600,6 @@ impl LlmProvider for OpenRouterProvider {
         req.header("authorization", format!("Bearer {api_key}"))
             .header("HTTP-Referer", "https://edytlab.app")
             .header("X-Title", "edytlab")
-            .header("content-type", "application/json")
     }
 }
 
@@ -764,7 +762,6 @@ impl LlmProvider for OpenAIProvider {
     }
     fn apply_auth(&self, req: reqwest::RequestBuilder, api_key: &str) -> reqwest::RequestBuilder {
         req.header("authorization", format!("Bearer {api_key}"))
-            .header("content-type", "application/json")
     }
     fn endpoint_path(&self) -> &str {
         "/v1/chat/completions"
@@ -1172,7 +1169,6 @@ impl LlmProvider for GroqProvider {
     }
     fn apply_auth(&self, req: reqwest::RequestBuilder, api_key: &str) -> reqwest::RequestBuilder {
         req.header("authorization", format!("Bearer {api_key}"))
-            .header("content-type", "application/json")
     }
     fn endpoint_path(&self) -> &str {
         "/v1/chat/completions"
@@ -1231,7 +1227,6 @@ impl LlmProvider for GeminiProvider {
     }
     fn apply_auth(&self, req: reqwest::RequestBuilder, api_key: &str) -> reqwest::RequestBuilder {
         req.header("authorization", format!("Bearer {api_key}"))
-            .header("content-type", "application/json")
     }
     fn endpoint_path(&self) -> &str {
         "/chat/completions"
@@ -1305,7 +1300,7 @@ impl LlmProvider for OllamaProvider {
         // No Authorization header at all. An empty `Bearer ` is worse
         // than none: it looks like a malformed credential rather than
         // an absent one.
-        req.header("content-type", "application/json")
+        req
     }
     fn credential_kind(&self) -> CredentialKind {
         CredentialKind::None
@@ -1471,6 +1466,25 @@ mod tests {
             built.headers().get("authorization").is_none(),
             "ollama must not send an Authorization header"
         );
+    }
+
+    /// A request carries exactly one `Content-Type`. `.json(body)` sets it,
+    /// and `RequestBuilder::header` appends rather than replaces, so an
+    /// `apply_auth` that sets it too sends two. Most servers tolerate that;
+    /// the ChatGPT plan route answers 400 `{"detail":"Unsupported content
+    /// type"}`.
+    #[test]
+    fn every_provider_sends_exactly_one_content_type_on_a_json_post() {
+        for id in SUPPORTED_PROVIDER_IDS {
+            let p = provider_from_id(id);
+            let req = reqwest::Client::new()
+                .post("https://example.invalid/v1/x")
+                .json(&serde_json::json!({}));
+            let built = p.apply_auth(req, "k").build().expect("request builds");
+            let all: Vec<_> = built.headers().get_all("content-type").iter().collect();
+            assert_eq!(all.len(), 1, "{id}: {all:?}");
+            assert_eq!(all[0], "application/json", "{id}");
+        }
     }
 
     #[test]
